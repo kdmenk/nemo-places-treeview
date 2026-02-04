@@ -24,6 +24,7 @@
 
 #include <config.h>
 
+#include "nemo-tree-sidebar-model.h"
 #include <gdk/gdkkeysyms.h>
 #include <gtk/gtk.h>
 #include <glib/gi18n.h>
@@ -32,6 +33,9 @@
 #include <cairo-gobject.h>
 #include <libxapp/xapp-favorites.h>
 
+#include <libnemo-private/nemo-clipboard.h>
+#include <libnemo-private/nemo-clipboard-monitor.h>
+#include <libnemo-private/nemo-desktop-icon-file.h>
 #include <libnemo-private/nemo-dnd.h>
 #include <libnemo-private/nemo-bookmark.h>
 #include <libnemo-private/nemo-global-preferences.h>
@@ -41,11 +45,14 @@
 #include <libnemo-private/nemo-file-operations.h>
 #include <libnemo-private/nemo-trash-monitor.h>
 #include <libnemo-private/nemo-icon-names.h>
+#include <libnemo-private/nemo-program-choosing.h>
+#include <libnemo-private/nemo-tree-view-drag-dest.h>
 #include <libnemo-private/nemo-cell-renderer-disk.h>
 #include <libnemo-private/nemo-places-tree-view.h>
 #include <libnemo-private/nemo-action-manager.h>
 #include <libnemo-private/nemo-action.h>
 #include <libnemo-private/nemo-ui-utilities.h>
+#include <libnemo-private/nemo-directory.h>
 
 #include <eel/eel-debug.h>
 #include <eel/eel-gtk-extensions.h>
@@ -87,8 +94,13 @@ typedef struct {
     GtkTreeViewColumn  *eject_column;
     GtkCellRenderer    *eject_icon_cell_renderer;
     GtkCellRenderer    *editable_renderer;
-	char 	           *uri;
-	GtkTreeStore       *store;
+	GtkCellRenderer    *icon_cell_renderer;
+	GtkCellRenderer    *padding_cell_renderer;
+	GtkCellRenderer    *heading_cell_renderer;
+	char 	           *selection_location;
+	gboolean            selecting;
+	void	       		   *store;
+    GtkTreeModel       *sort_model;
     GtkTreeModel       *store_filter;
 
 	NemoWindow *window;
@@ -105,6 +117,9 @@ typedef struct {
     guint bookmark_action_group_merge_id;
     GtkActionGroup *action_action_group;
     guint action_action_group_merge_id;
+
+    GtkActionGroup *tv_action_group;
+    guint tv_action_group_merge_id;
 
     gboolean actions_need_update;
 
@@ -149,6 +164,17 @@ typedef struct {
     guint popup_menu_action_index;
     guint update_places_on_idle_id;
 
+    guint hidden_files_changed_id;   
+	guint show_selection_idle_id;		
+
+    NemoFile *popup_file;
+    guint popup_file_idle_handler;
+
+    guint selection_changed_timer;
+    NemoFile *activation_file;
+    NemoWindowOpenFlags activation_flags;
+	NemoTreeViewDragDest *drag_dest;
+
 } NemoPlacesSidebar;
 
 typedef struct {
@@ -164,13 +190,16 @@ typedef struct {
 } NemoPlacesSidebarProviderClass;
 
 enum {
+	PLACES_SIDEBAR_COLUMN_NAME,			// FM_TREE_MODEL_DISPLAY_NAME_COLUMN
+	PLACES_SIDEBAR_COLUMN_GICON,         // FM_TREE_MODEL_CLOSED_ICON_COLUMN
+	PLACES_SIDEBAR_OPEN_ICON_COLUMN,     // FM_TREE_MODEL_OPEN_ICON_COLUMN
+	PLACES_SIDEBAR_FONT_STYLE_COLUMN,    // FM_TREE_MODEL_FONT_STYLE_COLUMN
+    PLACES_SIDEBAR_TEXT_WEIGHT_COLUMN,   // FM_TREE_MODEL_TEXT_WEIGHT_COLUMN
 	PLACES_SIDEBAR_COLUMN_ROW_TYPE,
 	PLACES_SIDEBAR_COLUMN_URI,
 	PLACES_SIDEBAR_COLUMN_DRIVE,
 	PLACES_SIDEBAR_COLUMN_VOLUME,
 	PLACES_SIDEBAR_COLUMN_MOUNT,
-	PLACES_SIDEBAR_COLUMN_NAME,
-	PLACES_SIDEBAR_COLUMN_GICON,
 	PLACES_SIDEBAR_COLUMN_INDEX,
 	PLACES_SIDEBAR_COLUMN_EJECT,
 	PLACES_SIDEBAR_COLUMN_NO_EJECT,
@@ -182,11 +211,12 @@ enum {
 	PLACES_SIDEBAR_COLUMN_HEADING_TEXT,
     PLACES_SIDEBAR_COLUMN_DF_PERCENT,
     PLACES_SIDEBAR_COLUMN_SHOW_DF,
-
+	PLACES_SIDEBAR_COLUMN_TREE_NAME,       // used for search in file tree view only
 	PLACES_SIDEBAR_COLUMN_COUNT
 };
 
 typedef enum {
+	PLACES_TREE_FOLDER,
 	PLACES_BUILT_IN,
 	PLACES_XDG_DIR,
 	PLACES_MOUNTED_VOLUME,
@@ -227,6 +257,12 @@ static void update_places                              (NemoPlacesSidebar *sideb
 static void update_places_on_idle                      (NemoPlacesSidebar *sidebar);
 static void rebuild_menu                               (NemoPlacesSidebar *sidebar);
 static void actions_changed                            (gpointer user_data);
+static gchar *get_icon_name 						   (const gchar *uri);
+static void refresh_highlight (NemoPlacesSidebar *sidebar);
+static gboolean get_selected_iter (NemoPlacesSidebar *sidebar, GtkTreeIter *iter);
+static gboolean get_selected_iter_for_store (NemoPlacesSidebar *sidebar, GtkTreeIter *iter);
+static gboolean nemo_places_sidebar_row_draggable (GtkTreeDragSource *drag_source, GtkTreePath *path, gpointer user_data);
+
 /* Identifiers for target types */
 enum {
   GTK_TREE_MODEL_ROW,
@@ -259,11 +295,6 @@ typedef struct {
 #define NEMO_SHORTCUTS_MODEL(obj) (G_TYPE_CHECK_INSTANCE_CAST ((obj), NEMO_SHORTCUTS_MODEL_TYPE, NemoShortcutsModel))
 
 GType _nemo_shortcuts_model_get_type (void);
-static void _nemo_shortcuts_model_drag_source_init (GtkTreeDragSourceIface *iface);
-G_DEFINE_TYPE_WITH_CODE (NemoShortcutsModel, _nemo_shortcuts_model, GTK_TYPE_TREE_STORE,
-			 G_IMPLEMENT_INTERFACE (GTK_TYPE_TREE_DRAG_SOURCE,
-						_nemo_shortcuts_model_drag_source_init));
-static GtkTreeStore *nemo_shortcuts_model_new (NemoPlacesSidebar *sidebar);
 
 G_DEFINE_TYPE (NemoPlacesSidebar, nemo_places_sidebar, GTK_TYPE_SCROLLED_WINDOW);
 
@@ -296,6 +327,46 @@ decrement_bookmark_breakpoint (NemoPlacesSidebar *sidebar)
     g_signal_handlers_unblock_by_func (nemo_window_state, breakpoint_changed_cb, sidebar);
 }
 
+
+static void
+get_fm_tree_model_iter (GtkTreeModel *model,
+                        GtkTreeIter  *iter,
+                        GtkTreeIter  *fm_iter)
+{
+    GtkTreeIter tmp_iter = *iter;
+    GtkTreeModel *child_model = model;
+    if (GTK_IS_TREE_MODEL_FILTER (model)) {
+        gtk_tree_model_filter_convert_iter_to_child_iter (GTK_TREE_MODEL_FILTER (model),
+                                                          &tmp_iter, iter);
+        child_model = gtk_tree_model_filter_get_model (GTK_TREE_MODEL_FILTER (model));
+    }
+
+    if (GTK_IS_TREE_MODEL_SORT (child_model)) {
+        gtk_tree_model_sort_convert_iter_to_child_iter (GTK_TREE_MODEL_SORT (child_model),
+                                                        fm_iter, &tmp_iter);
+    } else {
+        *fm_iter = tmp_iter;
+    }
+}
+
+static char *
+get_fm_tree_model_uri ( NemoPlacesSidebar *sidebar,
+					   GtkTreeModel *model,
+                        GtkTreeIter  *iter)
+{
+	char *uri=NULL;
+	if(uri==0) {
+		GtkTreeIter fm_iter;
+		get_fm_tree_model_iter (model, iter, &fm_iter);
+		NemoFile *file = fm_tree_model_iter_get_file (FM_TREE_MODEL (sidebar->store), &fm_iter);
+		if(file) {
+		    uri = nemo_file_get_uri(file);
+			nemo_file_unref(file);
+		}
+	}
+	return uri;
+}
+
 static gboolean
 should_show_desktop (void)
 {
@@ -323,15 +394,18 @@ add_heading (NemoPlacesSidebar *sidebar,
 {
 	GtkTreeIter cat_iter;
 
-	gtk_tree_store_append (sidebar->store, &cat_iter, NULL);
-	gtk_tree_store_set (sidebar->store, &cat_iter,
-			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, PLACES_HEADING,
-			    PLACES_SIDEBAR_COLUMN_SECTION_TYPE, section_type,
-			    PLACES_SIDEBAR_COLUMN_HEADING_TEXT, title,
-                PLACES_SIDEBAR_COLUMN_INDEX, -1,
-			    PLACES_SIDEBAR_COLUMN_EJECT, FALSE,
-			    PLACES_SIDEBAR_COLUMN_NO_EJECT, TRUE,
-			    -1);
+	if (!fm_tree_model_append_head_root_node(sidebar->store, title, &cat_iter)) {
+	    g_warning("Failed to append head root node");
+	    return cat_iter;
+	}
+	fm_tree_model_set (sidebar->store, &cat_iter,
+				PLACES_SIDEBAR_COLUMN_ROW_TYPE, PLACES_HEADING,
+				PLACES_SIDEBAR_COLUMN_SECTION_TYPE, section_type,
+				PLACES_SIDEBAR_COLUMN_HEADING_TEXT, title,
+	            PLACES_SIDEBAR_COLUMN_INDEX, -1,
+				PLACES_SIDEBAR_COLUMN_EJECT, FALSE,
+				PLACES_SIDEBAR_COLUMN_NO_EJECT, TRUE,
+				-1);
 
 	return cat_iter;
 }
@@ -408,13 +482,13 @@ new_place_info (PlaceType place_type,
 static void
 free_place_info (PlaceInfo *info)
 {
-    g_free (info->name);
-    g_free (info->icon_name);
-    g_free (info->uri);
+    g_clear_pointer(&info->name, g_free);
+    g_clear_pointer(&info->icon_name, g_free);
+    g_clear_pointer(&info->uri, g_free);
     g_clear_object (&info->drive);
     g_clear_object (&info->volume);
     g_clear_object (&info->mount);
-    g_free (info->tooltip);
+    g_clear_pointer(&info->tooltip, g_free);
 
     g_free (info);
 }
@@ -433,7 +507,8 @@ add_place (NemoPlacesSidebar *sidebar,
 	   const char *tooltip,
        int df_percent,
        gboolean show_df_percent,
-       GtkTreeIter cat_iter)
+       GtkTreeIter cat_iter,
+	   const gboolean showTreeView)
 {
 	GtkTreeIter           iter;
     GIcon *gicon;
@@ -457,28 +532,35 @@ add_place (NemoPlacesSidebar *sidebar,
 
     gicon = (icon_name != NULL) ? g_themed_icon_new (icon_name) : NULL;
 
-	gtk_tree_store_append (sidebar->store, &iter, &cat_iter);
-	gtk_tree_store_set (sidebar->store, &iter,
-			    PLACES_SIDEBAR_COLUMN_GICON, gicon,
-			    PLACES_SIDEBAR_COLUMN_NAME, name,
-			    PLACES_SIDEBAR_COLUMN_URI, uri,
-			    PLACES_SIDEBAR_COLUMN_DRIVE, drive,
-			    PLACES_SIDEBAR_COLUMN_VOLUME, volume,
-			    PLACES_SIDEBAR_COLUMN_MOUNT, mount,
-			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, place_type,
-			    PLACES_SIDEBAR_COLUMN_INDEX, index,
-			    PLACES_SIDEBAR_COLUMN_EJECT, show_eject_button,
-			    PLACES_SIDEBAR_COLUMN_NO_EJECT, !show_eject_button,
-			    PLACES_SIDEBAR_COLUMN_BOOKMARK, place_type != PLACES_BOOKMARK,
-                PLACES_SIDEBAR_COLUMN_TOOLTIP, tooltip,
-                PLACES_SIDEBAR_COLUMN_EJECT_ICON, show_eject_button ? "xsi-media-eject-symbolic" : NULL,
-			    PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE, EJECT_ICON_SIZE_NOT_HOVERED,
-			    PLACES_SIDEBAR_COLUMN_SECTION_TYPE, section_type,
-                PLACES_SIDEBAR_COLUMN_DF_PERCENT, df_percent,
-                PLACES_SIDEBAR_COLUMN_SHOW_DF, show_df_percent,
-			    -1);
+	if(uri) {
+		fm_tree_model_add_root_uri_head (sidebar->store, uri, &cat_iter , &iter, name ,
+							 gicon ? g_object_ref(gicon) : NULL,
+							 mount ? g_object_ref(mount) : NULL,
+							 showTreeView);
+	} else {
+		fm_tree_model_append_child_node (sidebar->store, &cat_iter, &iter);
+	}
+    fm_tree_model_set (sidebar->store, &iter,
+	    PLACES_SIDEBAR_COLUMN_GICON, gicon ? g_object_ref(gicon) : NULL,
+	    PLACES_SIDEBAR_COLUMN_NAME, name,
+	    PLACES_SIDEBAR_COLUMN_URI, uri,
+	    PLACES_SIDEBAR_COLUMN_DRIVE, drive ? g_object_ref(drive) : NULL,
+	    PLACES_SIDEBAR_COLUMN_VOLUME, volume ? g_object_ref(volume) : NULL,
+	    PLACES_SIDEBAR_COLUMN_MOUNT, mount ? g_object_ref(mount) : NULL,
+	    PLACES_SIDEBAR_COLUMN_ROW_TYPE, place_type,
+	    PLACES_SIDEBAR_COLUMN_INDEX, index,
+	    PLACES_SIDEBAR_COLUMN_EJECT, show_eject_button,
+	    PLACES_SIDEBAR_COLUMN_NO_EJECT, !show_eject_button,
+	    PLACES_SIDEBAR_COLUMN_BOOKMARK, place_type != PLACES_BOOKMARK,
+        PLACES_SIDEBAR_COLUMN_TOOLTIP, tooltip,
+        PLACES_SIDEBAR_COLUMN_EJECT_ICON, show_eject_button ? "xsi-media-eject-symbolic" : NULL,
+	    PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE, EJECT_ICON_SIZE_NOT_HOVERED,
+	    PLACES_SIDEBAR_COLUMN_SECTION_TYPE, section_type,
+        PLACES_SIDEBAR_COLUMN_DF_PERCENT, df_percent,
+        PLACES_SIDEBAR_COLUMN_SHOW_DF, show_df_percent,
+	    -1);
 
-    g_clear_object (&gicon);
+	g_object_unref(gicon);
 
     return cat_iter;
 }
@@ -497,8 +579,23 @@ restore_selection_foreach (GtkTreeModel *model,
 			   gpointer user_data)
 {
 	RestoreLocationData *data = user_data;
-	gchar *uri;
-
+	gchar *uri=NULL;
+	if (FM_IS_TREE_MODEL(model)) {
+		NemoFile *file = fm_tree_model_iter_get_file (FM_TREE_MODEL (model), iter);
+		if(file) {
+			uri = nemo_file_get_uri(file);
+			if(uri) {
+				if (g_strcmp0 (uri, data->last_uri) == 0 ||
+					g_strcmp0 (uri, data->location) == 0) {
+					data->path = gtk_tree_path_copy (path);
+				}
+				g_free (uri);
+				nemo_file_unref (file);
+				return (data->path != NULL);
+			}
+			nemo_file_unref (file);
+		}
+	}
 	gtk_tree_model_get (model, iter,
 			    PLACES_SIDEBAR_COLUMN_URI, &uri,
 			    -1);
@@ -507,7 +604,7 @@ restore_selection_foreach (GtkTreeModel *model,
 		data->path = gtk_tree_path_copy (path);
 	}
 
-	g_free (uri);
+	if(uri)g_free (uri);
 
 	return (data->path != NULL);
 }
@@ -556,7 +653,8 @@ restore_expand_state_foreach (GtkTreeModel *model,
 static void
 restore_expand_state (NemoPlacesSidebar *sidebar)
 {
-    gtk_tree_model_foreach (GTK_TREE_MODEL (sidebar->store_filter),
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+    gtk_tree_model_foreach (model,
                 restore_expand_state_foreach, sidebar);
 }
 
@@ -598,7 +696,8 @@ sidebar_update_restore_selection (NemoPlacesSidebar *sidebar,
 	data.sidebar = sidebar;
 	data.path = NULL;
 
-	gtk_tree_model_foreach (GTK_TREE_MODEL (sidebar->store_filter),
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+	gtk_tree_model_foreach (model,
 				restore_selection_foreach, &data);
 
 	if (data.path != NULL) {
@@ -713,12 +812,32 @@ get_icon_name (const gchar *uri)
 }
 
 static void
+update_filtering_from_preferences (NemoPlacesSidebar *sidebar)
+{
+    NemoWindowShowHiddenFilesMode mode;
+
+    if (sidebar->store == NULL) {
+        return;
+    }
+
+    mode = nemo_window_get_hidden_files_mode (sidebar->window);
+
+    fm_tree_model_set_show_hidden_files (sidebar->store,
+                                         mode == NEMO_WINDOW_SHOW_HIDDEN_FILES_ENABLE);
+
+    fm_tree_model_set_show_only_directories (sidebar->store,TRUE);
+}
+
+static void tree_model_remove_all_nodes (NemoPlacesSidebar *sidebar)
+{
+	fm_tree_model_remove_all_nodes( (FMTreeModel*) (sidebar->store) );
+}
+
+static void
 update_places (NemoPlacesSidebar *sidebar)
 {
 	NemoBookmark *bookmark;
-	GtkTreeSelection *selection;
 	GtkTreeIter last_iter, cat_iter;
-	GtkTreeModel *model;
 	GVolumeMonitor *volume_monitor;
 	GList *mounts, *l, *ll;
 	GMount *mount;
@@ -741,19 +860,22 @@ update_places (NemoPlacesSidebar *sidebar)
 
     sidebar->updating_sidebar = TRUE;
 
-	model = NULL;
+	if(sidebar->store == NULL) return;
 	last_uri = NULL;
 
     g_clear_pointer (&sidebar->top_bookend_uri, g_free);
     g_clear_pointer (&sidebar->bottom_bookend_uri, g_free);
 
-	selection = gtk_tree_view_get_selection (sidebar->tree_view);
-	if (gtk_tree_selection_get_selected (selection, &model, &last_iter)) {
-		gtk_tree_model_get (model,
-				    &last_iter,
-				    PLACES_SIDEBAR_COLUMN_URI, &last_uri, -1);
+	if (get_selected_iter (sidebar, &last_iter)) {
+		GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+		gtk_tree_model_get (GTK_TREE_MODEL (model),
+					&last_iter,
+					PLACES_SIDEBAR_COLUMN_URI, &last_uri, -1);
+		if(last_uri == NULL) {
+			last_uri = get_fm_tree_model_uri (sidebar, model, &last_iter);
+		}
 	}
-	gtk_tree_store_clear (sidebar->store);
+	tree_model_remove_all_nodes(sidebar);
 
 	sidebar->devices_header_added = FALSE;
 	sidebar->bookmarks_header_added = FALSE;
@@ -763,6 +885,8 @@ update_places (NemoPlacesSidebar *sidebar)
 
 	network_mounts = network_volumes = NULL;
 	volume_monitor = sidebar->volume_monitor;
+
+	update_filtering_from_preferences (sidebar);
 
     cat_iter = add_heading (sidebar, SECTION_COMPUTER,
                                     _("My Computer"));
@@ -784,7 +908,8 @@ update_places (NemoPlacesSidebar *sidebar)
                            mount_uri, NULL, NULL, NULL, 0,
                            tooltip,
                            full, home_on_different_fs (mount_uri) && full > -1,
-                           cat_iter);
+                           cat_iter,
+                           TRUE);
     g_free (icon);
     sidebar->top_bookend_uri = g_strdup (mount_uri);
     g_free (mount_uri);
@@ -800,7 +925,8 @@ update_places (NemoPlacesSidebar *sidebar)
                                _("Desktop"), icon,
                                mount_uri, NULL, NULL, NULL, 0,
                                _("Open the contents of your desktop in a folder"), 0, FALSE,
-                               cat_iter);
+                               cat_iter,
+                               FALSE);
         g_free (icon);
         g_free (sidebar->top_bookend_uri);
         sidebar->top_bookend_uri = g_strdup (mount_uri);
@@ -837,7 +963,8 @@ update_places (NemoPlacesSidebar *sidebar)
                                bookmark_name, icon, mount_uri,
                                NULL, NULL, NULL, bookmark_index,
                                tooltip, 0, FALSE,
-                               cat_iter);
+                               cat_iter,
+                               TRUE);
         g_object_unref (root);
         g_free (icon);
         g_free (mount_uri);
@@ -849,12 +976,13 @@ update_places (NemoPlacesSidebar *sidebar)
 
         if (n > 0) {
             mount_uri = (char *)"favorites:///"; /* No need to strdup */
-            icon = "xsi-user-favorites-symbolic";
+            icon = NEMO_ICON_SYMBOLIC_FOLDER_FAVORITES;
             cat_iter = add_place (sidebar, PLACES_BUILT_IN,
                                   SECTION_COMPUTER,
                                   _("Favorites"), icon, mount_uri,
                                   NULL, NULL, NULL, 0,
-                                  _("Favorite files"), 0, FALSE, cat_iter);
+                                  _("Favorite files"), 0, FALSE, cat_iter,
+                                  FALSE);
 
             sidebar->bottom_bookend_uri = g_strdup (mount_uri);
         }
@@ -871,7 +999,7 @@ update_places (NemoPlacesSidebar *sidebar)
                               SECTION_COMPUTER,
                               _("Recent"), icon, mount_uri,
                               NULL, NULL, NULL, 0,
-                              _("Recent files"), 0, FALSE, cat_iter);
+                              _("Recent files"), 0, FALSE, cat_iter, FALSE);
 
         if (sidebar->bottom_bookend_uri == NULL) {
             sidebar->bottom_bookend_uri = g_strdup (mount_uri);
@@ -894,7 +1022,8 @@ update_places (NemoPlacesSidebar *sidebar)
                            mount_uri, NULL, NULL, NULL, 0,
                            tooltip,
                            full, full > -1,
-                           cat_iter);
+                           cat_iter,
+                           TRUE);
     g_free (tooltip);
 
     if (sidebar->bottom_bookend_uri == NULL) {
@@ -909,7 +1038,8 @@ update_places (NemoPlacesSidebar *sidebar)
                                _("Trash"), icon, mount_uri,
                                NULL, NULL, NULL, 0,
                                _("Open the trash"), 0, FALSE,
-                               cat_iter);
+                               cat_iter,
+                               FALSE);
         g_free (icon);
     }
 
@@ -931,7 +1061,8 @@ update_places (NemoPlacesSidebar *sidebar)
                               bookmark_name, icon, mount_uri,
                               NULL, NULL, NULL, bookmark_index,
                               tooltip, 0, FALSE,
-                              cat_iter);
+                              cat_iter,
+                              TRUE);
         g_object_unref (root);
         g_free (icon);
         g_free (mount_uri);
@@ -986,22 +1117,6 @@ update_places (NemoPlacesSidebar *sidebar)
                 continue;
             }
         }
-
-        icon = nemo_get_mount_icon_name (mount);
-        mount_uri = g_file_get_uri (root);
-        name = g_mount_get_name (mount);
-        tooltip = g_file_get_parse_name (root);
-        place_info = new_place_info (PLACES_MOUNTED_VOLUME,
-                                     SECTION_DEVICES,
-                                     name, icon, mount_uri,
-                                     NULL, NULL, mount, 0, tooltip, 0, FALSE);
-        place_infos = g_list_prepend (place_infos, place_info);
-
-        g_free (icon);
-        g_free (name);
-        g_free (mount_uri);
-        g_free (tooltip);
-
         g_object_unref (root);
         g_object_unref (mount);
     }
@@ -1217,7 +1332,8 @@ update_places (NemoPlacesSidebar *sidebar)
                               info->tooltip,
                               info->df_percent,
                               info->show_df_percent,
-                              cat_iter);
+                              cat_iter,
+                              TRUE);
 
         free_place_info (info);
     }
@@ -1245,7 +1361,8 @@ update_places (NemoPlacesSidebar *sidebar)
                 				   SECTION_NETWORK,
                 				   name, icon, NULL,
                 				   NULL, volume, NULL, 0, tooltip, 0, FALSE,
-                                   cat_iter);
+                				   cat_iter,
+                				   TRUE);
 			g_free (icon);
 			g_free (name);
 			g_free (tooltip);
@@ -1266,7 +1383,8 @@ update_places (NemoPlacesSidebar *sidebar)
                 			   SECTION_NETWORK,
                 			   name, icon, mount_uri,
                 			   NULL, NULL, mount, 0, tooltip, 0, FALSE,
-                               cat_iter);
+                			   cat_iter,
+                			   TRUE);
 		g_object_unref (root);
 		g_free (icon);
 		g_free (name);
@@ -1284,7 +1402,8 @@ update_places (NemoPlacesSidebar *sidebar)
                 		   _("Network"), icon,
                 		   mount_uri, NULL, NULL, NULL, 0,
                 		   _("Browse the contents of the network"), 0, FALSE,
-                           cat_iter);
+                		   cat_iter,
+                		   FALSE);
 
 	/* restore selection */
     restore_expand_state (sidebar);
@@ -1297,6 +1416,159 @@ update_places (NemoPlacesSidebar *sidebar)
 	g_free (location);
 	g_free (last_uri);
 }
+
+
+
+static gboolean
+show_iter_for_file (NemoPlacesSidebar *sidebar, NemoFile *file, GtkTreeIter *iter)
+{
+	GtkTreeModel *model;
+	NemoFile *parent_file;
+	GtkTreeIter parent_iter;
+	GtkTreePath *path, *sort_path;
+	GtkTreeIter cur_iter;
+
+	if (sidebar->store == NULL) {
+		return FALSE;
+	}
+	model = GTK_TREE_MODEL (sidebar->store);
+
+	/* check if file is visible in the same root as the currently selected folder is */
+	gtk_tree_view_get_cursor (sidebar->tree_view, &path, NULL);
+	if (path != NULL) {
+		if (gtk_tree_model_get_iter (model, &cur_iter, path) &&
+		    fm_tree_model_file_get_iter (sidebar->store, iter,
+						 file, &cur_iter)) {
+			gtk_tree_path_free (path);
+			return TRUE;
+		}
+		gtk_tree_path_free (path);
+	}
+	/* check if file is visible at all */
+	if (fm_tree_model_file_get_iter (sidebar->store,
+					       iter, file, NULL)) {
+		return TRUE;
+	}
+
+	parent_file = nemo_file_get_parent (file);
+
+	if (parent_file == NULL) {
+		return FALSE;
+	}
+	if (!show_iter_for_file (sidebar, parent_file, &parent_iter)) {
+		nemo_file_unref (parent_file);
+		return FALSE;
+	}
+	nemo_file_unref (parent_file);
+
+	if (parent_iter.user_data == NULL || parent_iter.stamp == 0) {
+		return FALSE;
+	}
+	path = gtk_tree_model_get_path (model, &parent_iter);
+	sort_path = gtk_tree_model_sort_convert_child_path_to_path
+		( GTK_TREE_MODEL_SORT(sidebar->sort_model), path);
+	gtk_tree_path_free (path);
+	gtk_tree_view_expand_row (sidebar->tree_view, sort_path, FALSE);
+	gtk_tree_path_free (sort_path);
+
+	return FALSE;
+}
+
+static gboolean
+show_selection_idle_callback (gpointer callback_data)
+{
+	NemoPlacesSidebar *sidebar;
+
+	NemoFile *file, *old_file;
+	GtkTreeIter iter;
+	GtkTreePath *path, *sort_path=NULL;
+
+	sidebar = NEMO_PLACES_SIDEBAR (callback_data);
+
+	sidebar->show_selection_idle_id = 0;
+
+	file = nemo_file_get_by_uri (sidebar->selection_location);
+	if (file == NULL) {
+		return FALSE;
+	}
+
+	if (!nemo_file_is_directory (file)) {
+		old_file = file;
+		file = nemo_file_get_parent (file);
+		nemo_file_unref (old_file);
+		if (file == NULL) {
+			return FALSE;
+		}
+	}
+
+	sidebar->selecting = TRUE;
+	if (!show_iter_for_file (sidebar, file, &iter)) {
+		nemo_file_unref (file);
+		return FALSE;
+	}
+	sidebar->selecting = FALSE;
+
+	path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store), &iter);
+	if (path == NULL) {
+	    g_warning("Cannot get child path from iter");
+	    return FALSE;
+	}
+	// The empty path [] refers to top_root_node or dummy — skip
+	if (gtk_tree_path_get_depth(path) == 0) {
+	    g_debug("Skipping sort conversion for invisible top_root_node");
+	    gtk_tree_path_free(path);
+	    return FALSE;
+	}
+
+	g_assert(sidebar->sort_model != NULL);
+	g_assert(sidebar->store != NULL);
+	GtkTreeModel *real_child = gtk_tree_model_sort_get_model(GTK_TREE_MODEL_SORT (sidebar->sort_model));
+	g_assert(real_child == GTK_TREE_MODEL(sidebar->store));
+
+	sort_path = gtk_tree_model_sort_convert_child_path_to_path
+		(GTK_TREE_MODEL_SORT (sidebar->sort_model), path);
+if (!sort_path) {
+   // g_warning("sort_path == NULL for path %s", gtk_tree_path_to_string(path));
+
+	gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
+	if (gtk_widget_get_realized (GTK_WIDGET (sidebar->tree_view))) {
+		gtk_tree_view_scroll_to_cell (sidebar->tree_view, path, NULL, FALSE, 0, 0);
+	}
+    gtk_tree_path_free(path);
+    return FALSE;
+}
+
+	gtk_tree_path_free (path);
+	gtk_tree_view_set_cursor (sidebar->tree_view, sort_path, NULL, FALSE);
+	if (gtk_widget_get_realized (GTK_WIDGET (sidebar->tree_view))) {
+		gtk_tree_view_scroll_to_cell (sidebar->tree_view, sort_path, NULL, FALSE, 0, 0);
+	}
+	gtk_tree_path_free (sort_path);
+
+	nemo_file_unref (file);
+	refresh_highlight (sidebar);
+
+	return FALSE;
+}
+
+static void
+schedule_show_selection (NemoPlacesSidebar *sidebar)
+{
+	if (sidebar->show_selection_idle_id == 0) {
+		sidebar->show_selection_idle_id = g_idle_add (show_selection_idle_callback, sidebar);
+	}
+}
+
+static void
+schedule_select_and_show_location (NemoPlacesSidebar *sidebar, char *location)
+{
+	if (sidebar->selection_location != NULL) {
+		g_free (sidebar->selection_location);
+	}
+	sidebar->selection_location = g_strdup (location);
+	schedule_show_selection (sidebar);
+}
+
 
 static void
 mount_added_callback (GVolumeMonitor *volume_monitor,
@@ -1435,6 +1707,7 @@ clicked_eject_button (NemoPlacesSidebar *sidebar,
 		}
 	}
 
+	gdk_event_free(event);
 	return FALSE;
 }
 
@@ -1448,55 +1721,18 @@ desktop_setting_changed_callback (gpointer user_data)
 	update_places (sidebar);
 }
 
+
+
+
 static void
 loading_uri_callback (NemoWindow *window,
-                            char *location,
-               NemoPlacesSidebar *sidebar)
+                      char *location,
+                      NemoPlacesSidebar *sidebar)
 {
-    GtkTreeSelection *selection;
-    GtkTreeIter       iter_cat, iter_child;
-    gboolean          valid_cat, valid_child;
-    char              *uri;
-    gboolean found = FALSE;
-
-    if (strcmp (sidebar->uri, location) != 0) {
-        g_free (sidebar->uri);
-                sidebar->uri = g_strdup (location);
-
-        /* set selection if any place matches location */
-        selection = gtk_tree_view_get_selection (sidebar->tree_view);
-        gtk_tree_selection_unselect_all (selection);
-        valid_cat = gtk_tree_model_get_iter_first (GTK_TREE_MODEL (sidebar->store_filter),
-                                                    &iter_cat);
-
-        while (valid_cat) {
-            valid_child = gtk_tree_model_iter_children (GTK_TREE_MODEL (sidebar->store_filter),
-                                                        &iter_child,
-                                                        &iter_cat);
-            while (valid_child) {
-                gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter_child,
-                               	    PLACES_SIDEBAR_COLUMN_URI, &uri,
-                                    -1);
-                if (uri != NULL) {
-                    if (strcmp (uri, location) == 0) {
-                        g_free (uri);
-                        gtk_tree_selection_select_iter (selection, &iter_child);
-                        found = TRUE;
-                        break;
-                    }
-                    g_free (uri);
-                }
-                valid_child = gtk_tree_model_iter_next (GTK_TREE_MODEL (sidebar->store_filter),
-                                                        &iter_child);
-            }
-            if (found) {
-                break;
-            }
-            valid_cat = gtk_tree_model_iter_next (GTK_TREE_MODEL (sidebar->store_filter),
-							                         &iter_cat);
-		}
-    }
+	schedule_select_and_show_location (sidebar, location);
 }
+
+
 
 typedef struct {
     NemoPlacesSidebar *sidebar;
@@ -1632,13 +1868,16 @@ compute_drop_position (GtkTreeView *tree_view,
 			    PLACES_SIDEBAR_COLUMN_SECTION_TYPE, &section_type,
                 PLACES_SIDEBAR_COLUMN_URI, &drop_target_uri,
 			    -1);
+	if(drop_target_uri==NULL) {
+		drop_target_uri = get_fm_tree_model_uri (sidebar, model, &iter);
+	}
 	if (!cat_is_expanded (sidebar, section_type) && place_type == PLACES_HEADING) {
         if (sidebar->expand_timeout_source > 0) {
             goto fail;
         }
         CategoryExpandPayload *payload;
         GtkTreeViewColumn *col;
-        col = gtk_tree_view_get_column (GTK_TREE_VIEW (tree_view), 2);
+        col = gtk_tree_view_get_column (GTK_TREE_VIEW (tree_view), 0);
         payload = g_new0 (CategoryExpandPayload, 1);
         payload->sidebar = sidebar;
         gtk_tree_view_get_cell_area (tree_view,
@@ -1679,7 +1918,7 @@ compute_drop_position (GtkTreeView *tree_view,
 
     GdkRectangle rect;
     GtkTreeViewColumn *col;
-    col = gtk_tree_view_get_column (GTK_TREE_VIEW (tree_view), 1);
+    col = gtk_tree_view_get_column (GTK_TREE_VIEW (tree_view), 0);
     gtk_tree_view_get_cell_area (tree_view,
                                      *path,
                                      col,
@@ -1791,11 +2030,6 @@ drag_motion_callback (GtkTreeView *tree_view,
 		}
 	}
 
-    if (!sidebar->in_drag) {
-        sidebar->in_drag = TRUE;
-        gtk_tree_model_filter_refilter (GTK_TREE_MODEL_FILTER (sidebar->store_filter));
-    }
-
 	path = NULL;
 	res = compute_drop_position (tree_view, x, y, &path, &pos, sidebar);
 
@@ -1818,12 +2052,16 @@ drag_motion_callback (GtkTreeView *tree_view,
 		if (sidebar->drag_list == NULL) {
 			action = 0;
 		} else {
-			gtk_tree_model_get_iter (GTK_TREE_MODEL (sidebar->store_filter),
+			GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+			gtk_tree_model_get_iter (GTK_TREE_MODEL (model),
 						 &iter, path);
-			gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter),
+			gtk_tree_model_get (model,
 					    &iter,
 					    PLACES_SIDEBAR_COLUMN_URI, &uri,
 					    -1);
+			if(uri == NULL) {
+				uri = get_fm_tree_model_uri (sidebar, model, &iter);
+			}
             nemo_drag_default_drop_action_for_icons (context,
                                                      uri,
                                                      sidebar->drag_list,
@@ -1967,6 +2205,24 @@ get_selected_iter (NemoPlacesSidebar *sidebar,
 	return gtk_tree_selection_get_selected (selection, NULL, iter);
 }
 
+static gboolean
+get_selected_iter_for_store (NemoPlacesSidebar *sidebar,
+                   GtkTreeIter       *fm_iter)
+{
+    GtkTreeSelection *selection;
+    GtkTreeModel *model;
+    GtkTreeIter view_iter;
+
+    selection = gtk_tree_view_get_selection (sidebar->tree_view);
+
+    if (!gtk_tree_selection_get_selected (selection, &model, &view_iter))
+        return FALSE;
+
+    get_fm_tree_model_iter (model, &view_iter, fm_iter);
+
+    return TRUE;
+}
+
 static void
 update_bookmark_breakpoint (NemoPlacesSidebar *sidebar,
                                   SectionType  old_type,
@@ -1992,11 +2248,11 @@ reorder_bookmarks (NemoPlacesSidebar *sidebar,
 	int old_position;
 
 	/* Get the selected path */
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
                 PLACES_SIDEBAR_COLUMN_SECTION_TYPE, &old_section_type,
 			    PLACES_SIDEBAR_COLUMN_INDEX, &old_position,
@@ -2020,13 +2276,6 @@ reorder_bookmarks (NemoPlacesSidebar *sidebar,
 static gboolean
 idle_hide_bookmarks (gpointer user_data)
 {
-    NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (user_data);
-
-    if (sidebar->in_drag) {
-        sidebar->in_drag = FALSE;
-        gtk_tree_model_filter_refilter (GTK_TREE_MODEL_FILTER (sidebar->store_filter));
-    }
-
     return FALSE;
 }
 
@@ -2136,7 +2385,9 @@ drag_data_received_callback (GtkWidget *widget,
 			gtk_tree_model_get (model, &iter,
 					    PLACES_SIDEBAR_COLUMN_URI, &drop_uri,
 					    -1);
-
+			if(drop_uri==NULL) {
+				drop_uri = get_fm_tree_model_uri (sidebar, model, &iter);
+			}
 			switch (info) {
 			case TEXT_URI_LIST:
 				selection_list = build_selection_list ((const gchar *) gtk_selection_data_get_data (selection_data));
@@ -2258,6 +2509,17 @@ check_visibility (GMount           *mount,
 }
 
 static void
+set_action_sensitive (GtkActionGroup *action_group,
+                      const gchar    *name,
+                      gboolean        sensitive)
+{
+    GtkAction *action;
+
+    action = gtk_action_group_get_action (action_group, name);
+    gtk_action_set_sensitive (action, sensitive);
+}
+
+static void
 set_action_visible (GtkActionGroup *action_group,
                     const gchar    *name,
                     gboolean        visible)
@@ -2266,6 +2528,316 @@ set_action_visible (GtkActionGroup *action_group,
 
     action = gtk_action_group_get_action (action_group, name);
     gtk_action_set_visible (action, visible);
+}
+
+static GdkAtom copied_files_atom;
+
+static void
+clipboard_contents_received_callback (GtkClipboard     *clipboard,
+                      GtkSelectionData *selection_data,
+                      gpointer          data)
+{
+    NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (data);
+
+    if (gtk_selection_data_get_data_type (selection_data) == copied_files_atom
+        && gtk_selection_data_get_length (selection_data) > 0) {
+        set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_PASTE, TRUE);
+    }
+}
+
+
+static gboolean
+is_parent_writable (NemoFile *file)
+{
+	NemoFile *parent;
+	gboolean result;
+
+	parent = nemo_file_get_parent (file);
+
+	/* No parent directory, return FALSE */
+	if (parent == NULL) {
+		return FALSE;
+	}
+
+	result = nemo_file_can_write (parent);
+	nemo_file_unref (parent);
+
+	return result;
+}
+
+static GtkWindow *
+fm_tree_view_get_containing_window (NemoPlacesSidebar *sidebar)
+{
+	GtkWidget *window;
+
+	g_assert (NEMO_PLACES_SIDEBAR (sidebar));
+
+	window = gtk_widget_get_ancestor (GTK_WIDGET (sidebar), GTK_TYPE_WINDOW);
+	if (window == NULL) {
+		return NULL;
+	}
+
+	return GTK_WINDOW (window);
+}
+
+static void
+fm_tree_view_delete_cb (GtkAction *action,
+		        NemoPlacesSidebar *sidebar)
+{
+	GList *location_list;
+
+	if (!g_settings_get_boolean (nemo_preferences, NEMO_PREFERENCES_ENABLE_DELETE)) {
+		return;
+	}
+
+	location_list = g_list_prepend (NULL,
+					nemo_file_get_location (sidebar->popup_file));
+
+	nemo_file_operations_delete (location_list, fm_tree_view_get_containing_window (sidebar), NULL, NULL);
+	g_list_free_full (location_list, g_object_unref);
+}
+
+static void
+fm_tree_view_trash_cb (GtkAction *action,
+		       NemoPlacesSidebar *sidebar)
+{
+	GList *list;
+
+	if (!nemo_file_can_trash (sidebar->popup_file)) {
+		return;
+	}
+
+	list = g_list_prepend (NULL,
+			       nemo_file_get_location (sidebar->popup_file));
+
+	nemo_file_operations_trash_or_delete (list,
+						  fm_tree_view_get_containing_window (sidebar),
+						  NULL, NULL);
+	g_list_free_full (list, g_object_unref);
+}
+
+static void
+fm_tree_view_pin_unpin_cb (GtkAction *action,
+                           NemoPlacesSidebar *sidebar)
+{
+    nemo_file_set_pinning (sidebar->popup_file,
+                           !nemo_file_get_pinning (sidebar->popup_file));
+}
+
+static void
+paste_clipboard_data (NemoPlacesSidebar *sidebar,
+		      GtkSelectionData *selection_data,
+		      char *destination_uri)
+{
+	gboolean cut;
+	GList *item_uris;
+
+	cut = FALSE;
+	item_uris = nemo_clipboard_get_uri_list_from_selection_data (selection_data, &cut,
+									 copied_files_atom);
+
+	if (item_uris == NULL|| destination_uri == NULL) {
+		nemo_window_push_status (sidebar->window,
+						  _("There is nothing on the clipboard to paste."));
+	} else {
+		nemo_file_operations_copy_move
+			(item_uris, NULL, destination_uri,
+			 cut ? GDK_ACTION_MOVE : GDK_ACTION_COPY,
+			 GTK_WIDGET (sidebar->tree_view),
+			 NULL, NULL);
+
+		/* If items are cut then remove from clipboard */
+		if (cut) {
+			gtk_clipboard_clear (nemo_clipboard_get (GTK_WIDGET (sidebar)));
+		}
+
+		g_list_free_full (item_uris, g_free);
+	}
+}
+
+static void
+paste_into_clipboard_received_callback (GtkClipboard     *clipboard,
+					GtkSelectionData *selection_data,
+					gpointer          data)
+{
+	char *directory_uri;
+	NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (data);
+
+	directory_uri = nemo_file_get_uri (sidebar->popup_file);
+
+	paste_clipboard_data (sidebar, selection_data, directory_uri);
+
+	g_free (directory_uri);
+}
+
+static void
+fm_tree_view_paste_cb (GtkAction *action,
+		       NemoPlacesSidebar *sidebar)
+{
+	gtk_clipboard_request_contents (nemo_clipboard_get (GTK_WIDGET (sidebar->tree_view)),
+					copied_files_atom,
+					paste_into_clipboard_received_callback, sidebar);
+}
+
+static void
+copy_or_cut_files (NemoPlacesSidebar *sidebar,
+		   gboolean cut)
+{
+    GtkClipboard *clipboard;
+	char *status_string, *name;
+	NemoClipboardInfo info;
+        GtkTargetList *target_list;
+        GtkTargetEntry *targets;
+        int n_targets;
+
+	info.cut = cut;
+	info.files = g_list_prepend (NULL, sidebar->popup_file);
+
+        target_list = gtk_target_list_new (NULL, 0);
+        gtk_target_list_add (target_list, copied_files_atom, 0, 0);
+        gtk_target_list_add_uri_targets (target_list, 0);
+        gtk_target_list_add_text_targets (target_list, 0);
+
+        targets = gtk_target_table_new_from_list (target_list, &n_targets);
+        gtk_target_list_unref (target_list);
+
+    clipboard = nemo_clipboard_get (GTK_WIDGET (sidebar));
+
+    gtk_clipboard_set_with_data (clipboard,
+                                 targets, n_targets,
+                                 nemo_get_clipboard_callback, nemo_clear_clipboard_callback,
+                                 NULL);
+    gtk_clipboard_set_can_store (clipboard, NULL, 0);
+    gtk_target_table_free (targets, n_targets);
+
+	nemo_clipboard_monitor_set_clipboard_info (nemo_clipboard_monitor_get (),
+	                                               &info);
+	g_list_free (info.files);
+
+	name = nemo_file_get_display_name (sidebar->popup_file);
+	if (cut) {
+		status_string = g_strdup_printf (_("\"%s\" will be moved "
+						   "if you select the Paste command"),
+						 name);
+	} else {
+		status_string = g_strdup_printf (_("\"%s\" will be copied "
+						   "if you select the Paste command"),
+						 name);
+	}
+	g_free (name);
+
+	nemo_window_push_status (sidebar->window,
+					  status_string);
+	g_free (status_string);
+}
+
+static void
+fm_tree_view_cut_cb (GtkAction *action,
+		     NemoPlacesSidebar *sidebar)
+{
+	copy_or_cut_files (sidebar, TRUE);
+}
+
+static void
+fm_tree_view_copy_cb (GtkAction *action,
+		      NemoPlacesSidebar *sidebar)
+{
+	copy_or_cut_files (sidebar, FALSE);
+}
+
+
+static void
+update_menu_states_tree (NemoPlacesSidebar *sidebar)
+{
+	GtkTreeIter iter;
+    gboolean parent_file_is_writable;
+    gboolean file_is_home_or_desktop;
+    gboolean file_is_special_link;
+    gboolean can_move_file_to_trash;
+    gboolean can_delete_file;
+    gboolean using_browser;
+    gboolean is_dir;
+    gboolean can_write;
+	NemoFile *file=NULL;
+
+	if (get_selected_iter_for_store (sidebar, &iter)) {
+		file = fm_tree_model_iter_get_file (FM_TREE_MODEL (sidebar->store), &iter);
+	}
+    using_browser = g_settings_get_boolean (nemo_preferences,
+                                            NEMO_PREFERENCES_ALWAYS_USE_BROWSER);
+
+    gboolean show_unmount = FALSE;
+    gboolean show_eject = FALSE;
+    GMount *mount = NULL;
+
+    NemoFile *parent = nemo_file_get_parent (file);
+    GList *selected = g_list_prepend (NULL, file);
+
+    nemo_action_manager_update_action_states (sidebar->action_manager,
+                                              sidebar->action_action_group,
+                                              selected,
+                                              parent,
+                                              FALSE,
+                                              FALSE,
+                                              GTK_WINDOW (sidebar->window));
+	nemo_file_ref (file);
+    nemo_file_list_free (selected);   // fils is unrefed here
+    nemo_file_unref (parent);
+
+    is_dir = nemo_file_is_directory (file);
+    can_write = nemo_file_can_write (file);
+
+    set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_OPEN_ALTERNATE, is_dir);
+    set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_OPEN_IN_NEW_TAB, is_dir);
+    set_action_visible (sidebar->tv_action_group, NEMO_ACTION_OPEN_ALTERNATE, using_browser);
+    set_action_visible (sidebar->tv_action_group, NEMO_ACTION_OPEN_IN_NEW_TAB, using_browser);
+    set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_NEW_FOLDER, is_dir && can_write);
+    set_action_visible (sidebar->tv_action_group, NEMO_ACTION_NEW_FOLDER, !nemo_file_is_in_favorites (file));
+    set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_PASTE, FALSE);
+
+    if (is_dir && can_write) {
+        gtk_clipboard_request_contents (nemo_clipboard_get (GTK_WIDGET (sidebar->tree_view)),
+                                        copied_files_atom,
+                                        clipboard_contents_received_callback, sidebar);
+    }
+
+    can_move_file_to_trash = nemo_file_can_trash (file);
+    set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_TRASH, can_move_file_to_trash);
+
+    if (g_settings_get_boolean (nemo_preferences, NEMO_PREFERENCES_ENABLE_DELETE)) {
+    	parent_file_is_writable = is_parent_writable (file);
+    	file_is_home_or_desktop = nemo_file_is_home (file)
+    		|| nemo_file_is_desktop_directory (file);
+    	file_is_special_link = NEMO_IS_DESKTOP_ICON_FILE (file);
+
+    	can_delete_file = parent_file_is_writable
+    		&& !file_is_home_or_desktop
+    		&& !file_is_special_link;
+
+        set_action_visible (sidebar->tv_action_group, NEMO_ACTION_DELETE, TRUE);
+        set_action_sensitive (sidebar->tv_action_group, NEMO_ACTION_DELETE, can_delete_file);
+    } else {
+        set_action_visible (sidebar->tv_action_group, NEMO_ACTION_DELETE, FALSE);
+    }
+
+    mount = fm_tree_model_get_mount_for_root_node_file (sidebar->store, file);
+    if (mount) {
+    	show_unmount = g_mount_can_unmount (mount);
+    	show_eject = g_mount_can_eject (mount);
+    }
+
+    set_action_visible (sidebar->tv_action_group, NEMO_ACTION_UNMOUNT_VOLUME, show_unmount);
+    set_action_visible (sidebar->tv_action_group, NEMO_ACTION_EJECT_VOLUME, show_eject);
+
+    if (!nemo_file_is_in_favorites (file)) {
+        set_action_visible (sidebar->tv_action_group, NEMO_ACTION_PIN_FILE,  !nemo_file_get_pinning (file));
+        set_action_visible (sidebar->tv_action_group, NEMO_ACTION_UNPIN_FILE, nemo_file_get_pinning (file));
+    } else {
+        set_action_visible (sidebar->tv_action_group, NEMO_ACTION_PIN_FILE, FALSE);
+        set_action_visible (sidebar->tv_action_group, NEMO_ACTION_UNPIN_FILE, FALSE);
+    }
+	set_action_visible (sidebar->tv_action_group, NEMO_ACTION_PROPERTIES, FALSE);
+	nemo_file_unref (file);
 }
 
 static void
@@ -2294,8 +2866,8 @@ update_menu_states (NemoPlacesSidebar *sidebar)
 		return;
 	}
 
-	if (get_selected_iter (sidebar, &iter)) {
-		gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	if (get_selected_iter_for_store (sidebar, &iter)) {
+		gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 				    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
 				    PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
 				    PLACES_SIDEBAR_COLUMN_VOLUME, &volume,
@@ -2303,9 +2875,15 @@ update_menu_states (NemoPlacesSidebar *sidebar)
 				    PLACES_SIDEBAR_COLUMN_URI, &uri,
 				    -1);
 	}
-
+	if(uri==NULL) {
+		uri = get_fm_tree_model_uri (sidebar, sidebar->store, &iter);
+	}
     if (uri) {
-        NemoFile *file = nemo_file_get_by_uri (uri);
+		NemoFile *file =  fm_tree_model_iter_get_file(sidebar->store, &iter);
+		if(file) {
+			directory = nemo_directory_get_for_file(file);
+			show_properties = nemo_directory_is_local (directory);
+		}
         NemoFile *parent = nemo_file_get_parent (file);
 
         GList *selection = g_list_prepend (NULL, file);
@@ -2317,28 +2895,13 @@ update_menu_states (NemoPlacesSidebar *sidebar)
                                                   TRUE,
                                                   FALSE,
                                                   GTK_WINDOW (sidebar->window));
-        nemo_file_list_free (selection);
+        /* nemo_file_list_free (selection); internally unrefs file! */
+		nemo_file_list_free (selection);
         nemo_file_unref (parent);
     }
 
-    set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, (type == PLACES_MOUNTED_VOLUME));
-    set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_REMOVE, (type == PLACES_BOOKMARK));
-    set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_RENAME, (type == PLACES_BOOKMARK));
-    set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_EMPTY_TRASH_CONDITIONAL, !nemo_trash_monitor_is_empty ());
-
- 	check_visibility (mount, volume, drive,
- 			  &show_mount, &show_unmount, &show_eject, &show_rescan, &show_start, &show_stop);
-
-	/* We actually want both eject and unmount since eject will unmount all volumes.
-	 * TODO: hide unmount if the drive only has a single mountable volume
-	 */
-	show_empty_trash = (uri != NULL) &&
-			   (!strcmp (uri, "trash:///"));
-
-    g_free (uri);
-
 	/* Only show properties for local mounts */
-	show_properties = (mount != NULL);
+	//show_properties = (mount != NULL);
 	if (mount != NULL) {
 		location = g_mount_get_default_location (mount);
 		directory = nemo_directory_get (location);
@@ -2349,14 +2912,87 @@ update_menu_states (NemoPlacesSidebar *sidebar)
 		g_object_unref (location);
 	}
 
+	switch(type) {
+	case PLACES_TREE_FOLDER: {
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_CUT, TRUE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_COPY, TRUE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_PASTE, TRUE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_TRASH, TRUE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_DELETE, TRUE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, FALSE);
+		update_menu_states_tree(sidebar);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, TRUE);
+		/*
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, TRUE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_REMOVE, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_RENAME, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_NEW_FOLDER, TRUE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, show_properties);
+		 * */
+	    }
+		return;
+	case PLACES_BUILT_IN:
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_REMOVE, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_RENAME, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, show_properties);
+		break;
+	case PLACES_MOUNTED_VOLUME: {
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, TRUE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_REMOVE, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_RENAME, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, show_properties);
+	    }
+		break;
+	case PLACES_BOOKMARK:
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_REMOVE, TRUE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_RENAME, TRUE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, show_properties);
+		break;
+	default:
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_ADD_BOOKMARK, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_REMOVE, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_RENAME, FALSE);
+		set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, FALSE);
+		break;
+	}
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_NEW_FOLDER, FALSE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_DELETE, FALSE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_UNMOUNT_VOLUME, FALSE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_EJECT_VOLUME, FALSE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_PIN_FILE,  FALSE);
+		set_action_visible (sidebar->tv_action_group, NEMO_ACTION_UNPIN_FILE, FALSE);
+	set_action_visible (sidebar->tv_action_group, NEMO_ACTION_TRASH, FALSE);
+	set_action_visible (sidebar->tv_action_group, NEMO_ACTION_CUT, FALSE);
+	set_action_visible (sidebar->tv_action_group, NEMO_ACTION_COPY, FALSE);
+	set_action_visible (sidebar->tv_action_group, NEMO_ACTION_PASTE, FALSE);
+
+
+    set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_EMPTY_TRASH_CONDITIONAL, !nemo_trash_monitor_is_empty ());
+
+
+	/* We actually want both eject and unmount since eject will unmount all volumes.
+	 * TODO: hide unmount if the drive only has a single mountable volume
+	 */
+	show_empty_trash = (uri != NULL) &&
+			   (!strcmp (uri, "trash:///"));
+
+    g_free (uri);
+
+	check_visibility (mount, volume, drive,
+ 			  &show_mount, &show_unmount, &show_eject, &show_rescan, &show_start, &show_stop);
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_MOUNT_VOLUME, show_mount);
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_UNMOUNT_VOLUME, show_unmount);
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_EJECT_VOLUME, show_eject);
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_SIDEBAR_DETECT_MEDIA, show_rescan);
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_START_VOLUME, show_start);
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_STOP_VOLUME, show_stop);
+
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_EMPTY_TRASH_CONDITIONAL, show_empty_trash);
+	/*
     set_action_visible (sidebar->bookmark_action_group, NEMO_ACTION_PROPERTIES, show_properties);
+	 */
 
 	/* Adjust start/stop items to reflect the type of the drive */
     GtkAction *start_action, *stop_action;
@@ -2389,7 +3025,7 @@ update_menu_states (NemoPlacesSidebar *sidebar)
 
 		default:
 		case G_DRIVE_START_STOP_TYPE_UNKNOWN:
-			/* uses defaults set above */
+			// Uses defaults set above
 			break;
 		}
 	}
@@ -2400,12 +3036,14 @@ update_menu_states (NemoPlacesSidebar *sidebar)
 }
 
 /* Callback used when the selection in the shortcuts tree changes */
+
 static void
 bookmarks_selection_changed_cb (GtkTreeSelection      *selection,
 				NemoPlacesSidebar *sidebar)
 {
     update_menu_states (sidebar);
 }
+
 
 static void
 volume_mounted_cb (GVolume *volume,
@@ -2486,9 +3124,12 @@ open_selected_bookmark (NemoPlacesSidebar *sidebar,
 	if (!iter) {
 		return;
 	}
-
-	gtk_tree_model_get (model, iter, PLACES_SIDEBAR_COLUMN_URI, &uri, -1);
-
+	GtkTreeIter fm_iter;
+	get_fm_tree_model_iter (model, iter, &fm_iter);
+	gtk_tree_model_get (sidebar->store, &fm_iter, PLACES_SIDEBAR_COLUMN_URI, &uri, -1);
+	if (!uri) {
+		uri = get_fm_tree_model_uri (sidebar, sidebar->store, &fm_iter);
+	}
 	if (uri != NULL) {
 		DEBUG ("Activating bookmark %s", uri);
 
@@ -2513,10 +3154,14 @@ open_selected_bookmark (NemoPlacesSidebar *sidebar,
 		GVolume *volume;
 		NemoWindowSlot *slt;
 
-		gtk_tree_model_get (model, iter,
-				    PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
-				    PLACES_SIDEBAR_COLUMN_VOLUME, &volume,
-				    -1);
+		if( iter_is_valid ( FM_TREE_MODEL(sidebar->store),  &fm_iter)) {
+		  gtk_tree_model_get ( GTK_TREE_MODEL (sidebar->store), &fm_iter,
+					PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
+					PLACES_SIDEBAR_COLUMN_VOLUME, &volume,
+					-1);
+		} else {
+			return;
+		}
 
 		if (volume != NULL && !sidebar->mounting) {
 			sidebar->mounting = TRUE;
@@ -2592,17 +3237,19 @@ open_shortcut_in_new_tab_cb (GtkAction	      *item,
 static void
 add_bookmark (NemoPlacesSidebar *sidebar)
 {
-	GtkTreeModel *model;
+	//GtkTreeModel *model;
 	GtkTreeIter iter;
 	char *uri;
 	GFile *location;
 	NemoBookmark *bookmark;
 
-	model = gtk_tree_view_get_model (sidebar->tree_view);
+	//model = gtk_tree_view_get_model (sidebar->tree_view);
 
-	if (get_selected_iter (sidebar, &iter)) {
-		gtk_tree_model_get (model, &iter, PLACES_SIDEBAR_COLUMN_URI, &uri, -1);
-
+	if (get_selected_iter_for_store (sidebar, &iter)) {
+		gtk_tree_model_get (sidebar->store, &iter, PLACES_SIDEBAR_COLUMN_URI, &uri, -1);
+	    if (uri == NULL) {
+			uri = get_fm_tree_model_uri (sidebar, sidebar->store, &iter);
+		}
 		if (uri == NULL) {
 			return;
 		}
@@ -2635,9 +3282,10 @@ rename_selected_bookmark (NemoPlacesSidebar *sidebar)
 	GtkTreePath *path;
 	GtkTreeViewColumn *column;
 	PlaceType type;
+    GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
 
 	if (get_selected_iter (sidebar, &iter)) {
-		gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+		gtk_tree_model_get (GTK_TREE_MODEL (model), &iter,
 				    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
 				    -1);
 
@@ -2645,8 +3293,8 @@ rename_selected_bookmark (NemoPlacesSidebar *sidebar)
 			return;
 		}
 
-		path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store_filter), &iter);
-		column = gtk_tree_view_get_column (GTK_TREE_VIEW (sidebar->tree_view), 2);
+		path = gtk_tree_model_get_path (model, &iter);
+		column = gtk_tree_view_get_column (GTK_TREE_VIEW (sidebar->tree_view), 0);
 		g_object_set (sidebar->editable_renderer, "editable", TRUE, NULL);
 		gtk_tree_view_set_cursor_on_cell (GTK_TREE_VIEW (sidebar->tree_view),
 						path, column, sidebar->editable_renderer, TRUE);
@@ -2669,11 +3317,11 @@ remove_selected_bookmarks (NemoPlacesSidebar *sidebar)
 	PlaceType type;
 	int index;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
 			    -1);
 
@@ -2681,7 +3329,7 @@ remove_selected_bookmarks (NemoPlacesSidebar *sidebar)
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_INDEX, &index,
 			    -1);
 
@@ -2705,11 +3353,11 @@ mount_shortcut_cb (GtkAction           *item,
 	GtkTreeIter iter;
 	GVolume *volume;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_VOLUME, &volume,
 			    -1);
 
@@ -2787,11 +3435,11 @@ do_unmount_selection (NemoPlacesSidebar *sidebar)
 	GtkTreeIter iter;
 	GMount *mount;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_MOUNT, &mount,
 			    -1);
 
@@ -2935,11 +3583,11 @@ eject_shortcut_cb (GtkAction           *item,
 	GVolume *volume;
 	GDrive *drive;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_MOUNT, &mount,
 			    PLACES_SIDEBAR_COLUMN_VOLUME, &volume,
 			    PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
@@ -2964,7 +3612,7 @@ eject_or_unmount_bookmark (NemoPlacesSidebar *sidebar,
 	GDrive *drive;
 	gboolean ret;
 
-	model = GTK_TREE_MODEL (sidebar->store_filter);
+	model = gtk_tree_view_get_model (sidebar->tree_view);
 
 	if (!path) {
 		return FALSE;
@@ -3009,7 +3657,7 @@ eject_or_unmount_selection (NemoPlacesSidebar *sidebar)
 		return FALSE;
 	}
 
-	path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store_filter), &iter);
+	path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store), &iter);
 	if (path == NULL) {
 		return FALSE;
 	}
@@ -3050,11 +3698,11 @@ rescan_shortcut_cb (GtkAction           *item,
 	GtkTreeIter iter;
 	GDrive  *drive;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
 			    -1);
 
@@ -3094,11 +3742,11 @@ start_shortcut_cb (GtkAction           *item,
 	GtkTreeIter iter;
 	GDrive  *drive;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
 			    -1);
 
@@ -3148,11 +3796,11 @@ stop_shortcut_cb (GtkAction           *item,
 	GtkTreeIter iter;
 	GDrive  *drive;
 
-	if (!get_selected_iter (sidebar, &iter)) {
+	if (!get_selected_iter_for_store (sidebar, &iter)) {
 		return;
 	}
 
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 			    PLACES_SIDEBAR_COLUMN_DRIVE, &drive,
 			    -1);
 
@@ -3173,41 +3821,311 @@ empty_trash_cb (GtkAction           *item,
 }
 
 static gboolean
+select_first_child_row_or_expand (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
+{
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+    GtkTreeIter child_iter;
+	gboolean res;
+
+	GtkTreePath *path = gtk_tree_model_get_path (model, iter);
+	if (!path)
+        return FALSE;
+	gboolean expanded = gtk_tree_view_row_expanded(sidebar->tree_view, path);
+
+	if(expanded) {
+	  res = gtk_tree_model_iter_children(model, &child_iter, iter);
+	  if(res) {
+        *iter = child_iter;
+        gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
+	  }
+	} else
+	  gtk_tree_view_expand_row(sidebar->tree_view, path, FALSE);
+
+	gtk_tree_path_free (path);
+    return TRUE;
+}
+
+static gboolean
+goto_parent_or_collapse (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
+{
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+    GtkTreeIter parent_iter;
+	gboolean res=TRUE;
+
+	GtkTreePath *path = gtk_tree_model_get_path (model, iter);
+	if (!path)
+        return FALSE;
+	gboolean expanded = gtk_tree_view_row_expanded(sidebar->tree_view, path);
+
+	if(expanded)
+        gtk_tree_view_collapse_row(sidebar->tree_view, path);
+	else {
+	    res = gtk_tree_model_iter_parent(model, &parent_iter, iter);
+		if(res) {
+			*iter = parent_iter;
+			gtk_tree_path_free (path);
+			path = gtk_tree_model_get_path (model, iter);
+		    gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
+		}
+	}
+
+	gtk_tree_path_free (path);
+    return res;
+}
+
+
+static gboolean
 find_prev_or_next_row (NemoPlacesSidebar *sidebar,
 		       GtkTreeIter *iter,
 		       gboolean go_up)
 {
-	GtkTreeModel *model = GTK_TREE_MODEL (sidebar->store_filter);
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
 	gboolean res;
+	GtkTreeIter copy;
 	int place_type;
 
+	copy = *iter;
+
 	if (go_up) {
-		res = gtk_tree_model_iter_previous (model, iter);
+		res = gtk_tree_model_iter_previous (model, &copy);
 	} else {
-		res = gtk_tree_model_iter_next (model, iter);
+		res = gtk_tree_model_iter_next (model, &copy);
 	}
 
 	if (res) {
-		gtk_tree_model_get (model, iter,
+		gtk_tree_model_get (model, &copy,
 				    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &place_type,
 				    -1);
 		if (place_type == PLACES_HEADING) {
 			if (go_up) {
-				res = gtk_tree_model_iter_previous (model, iter);
+				res = gtk_tree_model_iter_previous (model, &copy);
 			} else {
-				res = gtk_tree_model_iter_next (model, iter);
+				res = gtk_tree_model_iter_next (model, &copy);
 			}
 		}
 	}
 
+	if (res)
+      *iter = copy;
 	return res;
 }
 
 static gboolean
-find_prev_row (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
+goto_first_child_if_expanded (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
 {
-	return find_prev_or_next_row (sidebar, iter, TRUE);
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+    GtkTreePath *path;
+    GtkTreeIter child_iter;
+
+    // Get the tree path of the current node
+    path = gtk_tree_model_get_path(model, iter);
+    if (!path)
+        return FALSE;
+
+    // Check if this node is currently expanded in the tree view
+    gboolean expanded = gtk_tree_view_row_expanded(sidebar->tree_view, path);
+
+    if (!expanded) {
+        gtk_tree_path_free(path);
+        return FALSE;  // not expanded → stop here
+    }
+
+    // Try to get the first child (works only if the node is expanded)
+    gboolean has_child = gtk_tree_model_iter_children(model, &child_iter, iter);
+
+    gtk_tree_path_free(path);
+
+    if (!has_child)
+        return FALSE;
+
+    // Replace the current iterator with the iterator of the first child
+    *iter = child_iter;
+    return TRUE;
 }
+
+static gboolean
+goto_prev_row_or_last_child_if_expanded (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
+{
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+    GtkTreeIter prev_iter;
+    GtkTreeIter current_iter;
+    GtkTreeIter deepest_iter;
+
+    // Try to move to the previous sibling row
+    if (!gtk_tree_model_iter_previous(model, iter)) {
+        return FALSE; // No previous sibling → nothing to do
+    }
+    prev_iter = *iter;
+
+    // Get the GtkTreePath for the new current row (the previous one)
+    GtkTreePath *path = gtk_tree_model_get_path(model, iter);
+    if (!path)
+        return FALSE;
+
+    // Check if the previous row is expanded in the tree view
+    gboolean expanded = gtk_tree_view_row_expanded(sidebar->tree_view, path);
+    gtk_tree_path_free(path);
+
+    if (!expanded) {
+        // Not expanded → we stop here (iter already points to it)
+        return TRUE;
+    }
+
+    // The previous row is expanded → go down to its last visible child (recursively)
+    if (!gtk_tree_model_iter_children(model, &current_iter, &prev_iter)) {
+        return TRUE; // Expanded but has no children
+    }
+
+    // Start with the first child
+    deepest_iter = current_iter;
+
+    // Iterate through all children to find the last one
+    GtkTreeIter next_iter = current_iter;
+    while (gtk_tree_model_iter_next(model, &next_iter)) {
+        deepest_iter = next_iter;
+    }
+
+    // Now check if the deepest_iter has children and is expanded
+    GtkTreePath *deepest_path = gtk_tree_model_get_path(model, &deepest_iter);
+    if (deepest_path) {
+        gboolean deepest_expanded = gtk_tree_view_row_expanded(sidebar->tree_view, deepest_path);
+        gtk_tree_path_free(deepest_path);
+
+        // If the deepest child is expanded, recursively find its last child
+        while (deepest_expanded) {
+            GtkTreeIter child_iter;
+            if (!gtk_tree_model_iter_children(model, &child_iter, &deepest_iter)) {
+                break; // No more children
+            }
+
+            // Find the last child of the current deepest_iter
+            deepest_iter = child_iter;
+            GtkTreeIter temp_iter = child_iter;
+            while (gtk_tree_model_iter_next(model, &temp_iter)) {
+                deepest_iter = temp_iter;
+            }
+
+            // Check if the new deepest_iter is expanded
+            deepest_path = gtk_tree_model_get_path(model, &deepest_iter);
+            if (deepest_path) {
+                deepest_expanded = gtk_tree_view_row_expanded(sidebar->tree_view, deepest_path);
+                gtk_tree_path_free(deepest_path);
+            } else {
+                deepest_expanded = FALSE;
+            }
+        }
+    }
+
+    // Replace current iter with the deepest child
+    *iter = deepest_iter;
+    return TRUE;
+}
+
+
+static gboolean
+iter_equal(GtkTreeModel *model,
+           GtkTreeIter *a,
+           GtkTreeIter *b)
+{
+    GtkTreePath *path_a = gtk_tree_model_get_path(model, a);
+    GtkTreePath *path_b = gtk_tree_model_get_path(model, b);
+
+    gboolean equal = gtk_tree_path_compare(path_a, path_b) == 0;
+
+    gtk_tree_path_free(path_a);
+    gtk_tree_path_free(path_b);
+
+    return equal;
+}
+
+static gboolean
+find_parent_or_next_sibling_row(NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
+{
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+    GtkTreeIter current_iter = *iter;
+
+    while (TRUE) {
+        GtkTreeIter parent_iter;
+        if (!gtk_tree_model_iter_parent(model, &parent_iter, &current_iter)) {
+            // no parent → no higher sibling found
+			*iter = current_iter;
+			if (gtk_tree_model_iter_next(model, &current_iter)) {
+                    *iter = current_iter;
+                    return TRUE;
+			}
+            return FALSE;
+        }
+
+        // Search for the next visible sibling beside the parent
+        GtkTreeIter child_iter;
+        if (!gtk_tree_model_iter_children(model, &child_iter, &parent_iter)) {
+            current_iter = parent_iter;
+            continue; // No children → one level up
+        }
+
+        do {
+            if (iter_equal(model, &child_iter, &current_iter)) {
+                // We are at the current iterator → check next child
+                if (gtk_tree_model_iter_next(model, &child_iter)) {
+                    *iter = child_iter;
+                    return TRUE;
+                } else {
+                    break; // no mre siblings -> next higher level
+                }
+            }
+        } while (gtk_tree_model_iter_next(model, &child_iter));
+
+        // Next sibling not found on this level → one level higher
+        current_iter = parent_iter;
+    }
+}
+
+
+static gboolean
+select_prev_or_next_node (NemoPlacesSidebar *sidebar,
+		       GtkTreeIter *iter,
+		       gboolean go_up)
+{
+	GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+	gboolean res;
+	GtkTreeIter iterCopy;
+
+	iterCopy = *iter;
+
+	if (go_up) {
+		res = goto_prev_row_or_last_child_if_expanded (sidebar, &iterCopy);
+		if(!res) {
+			// go to parent
+			iterCopy = *iter;
+            res = gtk_tree_model_iter_parent(model,  &iterCopy, iter);
+		}
+	} else {
+		res = goto_first_child_if_expanded (sidebar, &iterCopy);
+		if(!res) {
+			// go to next child in same row
+			iterCopy = *iter;
+			res = gtk_tree_model_iter_next (model, &iterCopy);
+			if(!res) {
+				iterCopy = *iter;
+				res = find_parent_or_next_sibling_row(sidebar, &iterCopy);
+				if(!res)
+					iterCopy = *iter;
+			}
+		}
+	}
+	if (res) {
+          *iter = iterCopy;
+          GtkTreePath *path = gtk_tree_model_get_path (model, &iterCopy);
+
+          GtkTreeSelection *sel = gtk_tree_view_get_selection(sidebar->tree_view);
+          gtk_tree_selection_unselect_all(sel);
+          gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
+          gtk_tree_path_free (path);
+	}
+	return res;
+
+}
+
 
 static gboolean
 find_next_row (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
@@ -3217,37 +4135,15 @@ find_next_row (NemoPlacesSidebar *sidebar, GtkTreeIter *iter)
 
 static void
 properties_cb (GtkAction           *item,
-	       NemoPlacesSidebar *sidebar)
+	           NemoPlacesSidebar *sidebar)
 {
-	GtkTreeModel *model;
-	GtkTreePath *path = NULL;
-	GtkTreeIter iter;
 	GList *list;
-	NemoFile *file;
-	char *uri;
+    if(sidebar->popup_file == NULL) return;
+	list = g_list_prepend (NULL, nemo_file_ref (sidebar->popup_file));
 
-	model = gtk_tree_view_get_model (sidebar->tree_view);
-	gtk_tree_view_get_cursor (sidebar->tree_view, &path, NULL);
+	nemo_properties_window_present (list, GTK_WIDGET (sidebar->tree_view), NULL);
 
-	if (path == NULL || !gtk_tree_model_get_iter (model, &iter, path)) {
-		gtk_tree_path_free (path);
-		return;
-	}
-
-	gtk_tree_model_get (model, &iter, PLACES_SIDEBAR_COLUMN_URI, &uri, -1);
-
-	if (uri != NULL) {
-
-		file = nemo_file_get_by_uri (uri);
-		list = g_list_prepend (NULL, nemo_file_ref (file));
-
-		nemo_properties_window_present (list, GTK_WIDGET (sidebar), NULL);
-
-		nemo_file_list_free (list);
-		g_free (uri);
-	}
-
-	gtk_tree_path_free (path);
+    nemo_file_list_free (list);
 }
 
 static gboolean
@@ -3258,14 +4154,14 @@ nemo_places_sidebar_focus (GtkWidget *widget,
 	GtkTreePath *path;
 	GtkTreeIter iter, child_iter;
 	gboolean res;
-
+    GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
 	res = get_selected_iter (sidebar, &iter);
 	if (!res) {
-		gtk_tree_model_get_iter_first (GTK_TREE_MODEL (sidebar->store_filter), &iter);
-        gtk_tree_model_iter_children (GTK_TREE_MODEL (sidebar->store_filter), &child_iter, &iter);
+		gtk_tree_model_get_iter_first (model, &iter);
+        gtk_tree_model_iter_children (model, &child_iter, &iter);
 		res = find_next_row (sidebar, &child_iter);
 		if (res) {
-			path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store_filter), &iter);
+			path = gtk_tree_model_get_path (model, &iter);
 			gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
 			gtk_tree_path_free (path);
 		}
@@ -3282,68 +4178,76 @@ bookmarks_key_press_event_cb (GtkWidget             *widget,
 {
   guint modifiers;
   GtkTreeIter selected_iter;
-  GtkTreePath *path;
 
-  if (event->keyval == GDK_KEY_slash ||
-    event->keyval == GDK_KEY_KP_Divide ||
-    event->keyval == GDK_KEY_asciitilde) {
-    if (gtk_bindings_activate_event (G_OBJECT (sidebar->window), event)) {
-        return GDK_EVENT_STOP;
-    }
+  switch (event->keyval) {
+ 	  case GDK_KEY_slash:
+	  case GDK_KEY_KP_Divide:
+	  case GDK_KEY_asciitilde:
+          if (gtk_bindings_activate_event(G_OBJECT(sidebar->window), event))
+              return GDK_EVENT_STOP;
+          break;
+	  default:
+          break;
   }
 
-  if (!get_selected_iter (sidebar, &selected_iter)) {
+  if (!get_selected_iter (sidebar, &selected_iter))
 	  return FALSE;
-  }
 
   modifiers = gtk_accelerator_get_default_mod_mask ();
 
-  if ((event->keyval == GDK_KEY_Return ||
-       event->keyval == GDK_KEY_KP_Enter ||
-       event->keyval == GDK_KEY_ISO_Enter ||
-       event->keyval == GDK_KEY_space)) {
-      NemoWindowOpenFlags flags = 0;
-
-      if ((event->state & modifiers) == GDK_SHIFT_MASK) {
-          flags = NEMO_WINDOW_OPEN_FLAG_NEW_TAB;
-      } else if ((event->state & modifiers) == GDK_CONTROL_MASK) {
-          flags = NEMO_WINDOW_OPEN_FLAG_NEW_WINDOW;
-      }
-
-      open_selected_bookmark (sidebar, GTK_TREE_MODEL (sidebar->store_filter),
-			      &selected_iter, flags);
-      return TRUE;
+  switch(event->keyval) {
+	  case GDK_KEY_Return:
+	  case GDK_KEY_KP_Enter:
+	  case GDK_KEY_ISO_Enter:
+	  case GDK_KEY_space:
+	      NemoWindowOpenFlags flags = 0;
+          if ((event->state & modifiers) == GDK_SHIFT_MASK) {
+              flags = NEMO_WINDOW_OPEN_FLAG_NEW_TAB;
+          } else if ((event->state & modifiers) == GDK_CONTROL_MASK) {
+              flags = NEMO_WINDOW_OPEN_FLAG_NEW_WINDOW;
+          }
+		  GtkTreeModel *model = gtk_tree_view_get_model (sidebar->tree_view);
+          open_selected_bookmark (sidebar, model,
+					  &selected_iter, flags);
+          return TRUE;
+	      break;
+	  case GDK_KEY_Down:
+          if ((event->state & modifiers) == GDK_MOD1_MASK) {
+               return eject_or_unmount_selection (sidebar);
+		  } else {
+			  if ((event->state & modifiers) == 0) {
+		         select_prev_or_next_node (sidebar, &selected_iter, FALSE);
+			     return TRUE;
+			  }
+          }
+		  break;
+	  case GDK_KEY_Up:
+          if ((event->state & modifiers) == 0) {
+            select_prev_or_next_node (sidebar, &selected_iter, TRUE);
+            return TRUE;
+		  }
+          break;
+	  case GDK_KEY_F2:
+          if ((event->state & modifiers) == 0) {
+              rename_selected_bookmark (sidebar);
+              return TRUE;
+          }
+          break;
+	  case GDK_KEY_Left:
+	      if ((event->state & modifiers) == 0) {
+	        goto_parent_or_collapse(sidebar, &selected_iter);
+            return TRUE;
+		  }
+          break;
+	  case GDK_KEY_Right:
+	      if ((event->state & modifiers) == 0) {
+	        select_first_child_row_or_expand(sidebar, &selected_iter);
+            return TRUE;
+		  }
+          break;
+	  default:
+	      return FALSE;
   }
-
-  if (event->keyval == GDK_KEY_Down &&
-      (event->state & modifiers) == GDK_MOD1_MASK) {
-      return eject_or_unmount_selection (sidebar);
-  }
-
-  if (event->keyval == GDK_KEY_Up) {
-      if (find_prev_row (sidebar, &selected_iter)) {
-	      path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store_filter), &selected_iter);
-	      gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
-	      gtk_tree_path_free (path);
-      }
-      return TRUE;
-  }
-
-  if (event->keyval == GDK_KEY_Down) {
-      if (find_next_row (sidebar, &selected_iter)) {
-	      path = gtk_tree_model_get_path (GTK_TREE_MODEL (sidebar->store_filter), &selected_iter);
-	      gtk_tree_view_set_cursor (sidebar->tree_view, path, NULL, FALSE);
-	      gtk_tree_path_free (path);
-      }
-      return TRUE;
-  }
-
-  if ((event->keyval == GDK_KEY_F2)
-      && (event->state & modifiers) == 0) {
-      rename_selected_bookmark (sidebar);
-      return TRUE;
-  }
-
   return FALSE;
 }
 
@@ -3354,8 +4258,8 @@ run_action_callback (GtkAction *action, gpointer user_data)
     gchar *uri = NULL;
     GtkTreeIter iter;
 
-    if (get_selected_iter (sidebar, &iter)) {
-        gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+    if (get_selected_iter_for_store (sidebar, &iter)) {
+        gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
                     PLACES_SIDEBAR_COLUMN_URI, &uri,
                     -1);
     }
@@ -3374,6 +4278,35 @@ run_action_callback (GtkAction *action, gpointer user_data)
     nemo_file_unref (parent);
 
     g_free (uri);
+}
+
+static gboolean
+free_popup_file_in_idle_cb (gpointer user_data)
+{
+	NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (user_data);
+
+	if (sidebar->popup_file != NULL) {
+		nemo_file_unref (sidebar->popup_file);
+		sidebar->popup_file = NULL;
+	}
+	sidebar->popup_file_idle_handler = 0;
+	return FALSE;
+}
+
+static void
+popup_menu_deactivated (GtkMenuShell *menu_shell, gpointer user_data)
+{
+	NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (user_data);
+
+	/* The popup menu is deactivated. (I.E. hidden)
+	   We want to free popup_file, but can't right away as it might immediately get
+	   used if we're deactivation due to activating a menu item. So, we free it in
+	   idle */
+
+	if (sidebar->popup_file != NULL &&
+	    sidebar->popup_file_idle_handler == 0) {
+		sidebar->popup_file_idle_handler = g_idle_add (free_popup_file_in_idle_cb, sidebar);
+	}
 }
 
 #if GTK_CHECK_VERSION (3, 24, 8)
@@ -3416,7 +4349,19 @@ static void
 bookmarks_popup_menu (NemoPlacesSidebar *sidebar,
 		      GdkEventButton        *event)
 {
+	char *uri = NULL;
+	GtkTreeIter iter;
+
     update_menu_states (sidebar);
+	if (get_selected_iter_for_store (sidebar, &iter)) {
+		uri = get_fm_tree_model_uri (sidebar, sidebar->store, &iter);
+		if(uri!=NULL) {
+			NemoFile *file = nemo_file_get_by_uri (uri);
+			sidebar->popup_file = nemo_file_ref (file);
+			nemo_file_unref (file);
+			g_free (uri);
+		}
+	}
     eel_pop_up_context_menu (GTK_MENU(sidebar->popup_menu),
                              (GdkEvent *) event,
                              GTK_WIDGET (sidebar));
@@ -3498,6 +4443,42 @@ clear_ui (NemoPlacesSidebar *sidebar)
                         &sidebar->action_action_group_merge_id,
                         &sidebar->action_action_group);
 
+    nemo_ui_unmerge_ui (sidebar->ui_manager,
+		                &sidebar->tv_action_group_merge_id,
+		                &sidebar->tv_action_group);
+
+}
+
+static void
+new_folder_done (GFile *new_folder,
+		 gboolean success,
+		 gpointer data)
+{
+	GList *list;
+
+	/* show the properties window for the newly created
+	 * folder so the user can change its name
+	 */
+	list = g_list_prepend (NULL, nemo_file_get (new_folder));
+
+	nemo_properties_window_present (list, GTK_WIDGET (data), NULL);
+
+        nemo_file_list_free (list);
+}
+
+static void
+create_folder_cb (GtkAction *action,
+			       NemoPlacesSidebar *sidebar)
+{
+	char *parent_uri;
+	if(sidebar->popup_file == NULL) return;
+	parent_uri = nemo_file_get_uri (sidebar->popup_file);
+	nemo_file_operations_new_folder (GTK_WIDGET (sidebar->tree_view),
+					     NULL,
+					     parent_uri,
+					     new_folder_done, sidebar->tree_view);
+
+	g_free (parent_uri);
 }
 
 static const GtkActionEntry bookmark_action_entries[] = {
@@ -3516,6 +4497,24 @@ static const GtkActionEntry bookmark_action_entries[] = {
     { NEMO_ACTION_EMPTY_TRASH_CONDITIONAL, NULL,                   N_("_Empty _Trash"),        NULL, NULL, G_CALLBACK (empty_trash_cb)                 },
     { NEMO_ACTION_PROPERTIES,              NULL,                   N_("_Properties"),          NULL, NULL, G_CALLBACK (properties_cb)                  },
 };
+
+static const GtkActionEntry tree_sidebar_menu_entries[] = {
+    { NEMO_ACTION_OPEN,                    "folder-open-symbolic",        N_("_Open"),                NULL, NULL, G_CALLBACK (open_shortcut_cb)               },
+    { NEMO_ACTION_OPEN_IN_NEW_TAB,         NULL,                          N_("Open in New _Tab"),     NULL, NULL, G_CALLBACK (open_shortcut_in_new_tab_cb)    },
+    { NEMO_ACTION_OPEN_ALTERNATE,          NULL,                          N_("Open in New _Window"),  NULL, NULL, G_CALLBACK (open_shortcut_in_new_window_cb) },
+    { NEMO_ACTION_NEW_FOLDER,              NULL,                          N_("Create New _Folder"),   NULL, NULL, G_CALLBACK (create_folder_cb)      },
+    { NEMO_ACTION_CUT,                     "edit-cut-symbolic",           N_("Cu_t"),                 NULL, NULL, G_CALLBACK (fm_tree_view_cut_cb)                },
+    { NEMO_ACTION_COPY,                    "edit-copy-symbolic",          N_("_Copy"),                NULL, NULL, G_CALLBACK (fm_tree_view_copy_cb)               },
+    { NEMO_ACTION_PASTE,                   "edit-paste-symbolic",         N_("_Paste Into Folder"),   NULL, NULL, G_CALLBACK (fm_tree_view_paste_cb)              },
+    { NEMO_ACTION_PIN_FILE,                "xapp-pin-symbolic",           N_("P_in"),                 NULL, NULL, G_CALLBACK (fm_tree_view_pin_unpin_cb)          },
+    { NEMO_ACTION_UNPIN_FILE,              "xapp-unpin-symbolic",         N_("Unp_in"),               NULL, NULL, G_CALLBACK (fm_tree_view_pin_unpin_cb)          },
+    { NEMO_ACTION_TRASH,                   "user-trash-full-symbolic",    N_("Mo_ve to Trash"),       NULL, NULL, G_CALLBACK (fm_tree_view_trash_cb)              },
+    { NEMO_ACTION_DELETE,                  "edit-delete-symbolic",        N_("_Delete"),              NULL, NULL, G_CALLBACK (fm_tree_view_delete_cb)             },
+    { NEMO_ACTION_UNMOUNT_VOLUME,          NULL,                          N_("_Unmount"),             NULL, NULL, G_CALLBACK (unmount_shortcut_cb)            },
+    { NEMO_ACTION_EJECT_VOLUME,            NULL,                          N_("_Eject"),               NULL, NULL, G_CALLBACK (eject_shortcut_cb)              },
+    { NEMO_ACTION_PROPERTIES,             "document-properties-symbolic", N_("_Properties"),          NULL, NULL, G_CALLBACK (properties_cb)         },
+};
+
 
 static void
 rebuild_menu (NemoPlacesSidebar *sidebar)
@@ -3540,6 +4539,11 @@ rebuild_menu (NemoPlacesSidebar *sidebar)
                               &sidebar->action_action_group_merge_id,
                               &sidebar->action_action_group);
 
+    nemo_ui_prepare_merge_ui (sidebar->ui_manager,
+                              "NemoTreeviewSidebarFileActions",
+                              &sidebar->tv_action_group_merge_id,
+                              &sidebar->tv_action_group);
+
     sidebar->bookmark_action_group_merge_id =
             gtk_ui_manager_add_ui_from_resource (sidebar->ui_manager, "/org/nemo/nemo-places-sidebar-ui.xml", NULL);
 
@@ -3547,6 +4551,17 @@ rebuild_menu (NemoPlacesSidebar *sidebar)
                                   bookmark_action_entries,
                                   G_N_ELEMENTS (bookmark_action_entries),
                                   sidebar);
+
+    sidebar->tv_action_group_merge_id =
+            gtk_ui_manager_add_ui_from_resource (sidebar->ui_manager, "/org/nemo/nemo-tree-sidebar-ui.xml", NULL);
+
+
+    gtk_action_group_add_actions (sidebar->tv_action_group,
+                                  tree_sidebar_menu_entries,
+                                  G_N_ELEMENTS (tree_sidebar_menu_entries),
+                                  sidebar);
+
+
 
     nemo_action_manager_iterate_actions (sidebar->action_manager,
                                          (NemoActionManagerIterFunc) add_action_to_ui,
@@ -3556,6 +4571,10 @@ rebuild_menu (NemoPlacesSidebar *sidebar)
         GtkWidget *menu = gtk_ui_manager_get_widget (sidebar->ui_manager, "/selection");
         gtk_menu_set_screen (GTK_MENU (menu), gtk_widget_get_screen (GTK_WIDGET (sidebar->window)));
         sidebar->popup_menu = menu;
+
+        g_signal_connect (sidebar->popup_menu, "deactivate",
+                          G_CALLBACK (popup_menu_deactivated),
+                          sidebar);
 
 #if GTK_CHECK_VERSION (3, 24, 8)
         g_signal_connect (sidebar->popup_menu, "realize",
@@ -3690,8 +4709,9 @@ clear_eject_hover (GtkTreeModel *model,
     ClearHoverData *hdata = data;
     gint size;
     gboolean can_eject = FALSE;
-
-    gtk_tree_model_get (model, iter,
+	GtkTreeIter fm_iter;
+	get_fm_tree_model_iter (model, iter, &fm_iter);
+    gtk_tree_model_get (hdata->sidebar->store, &fm_iter,
                         PLACES_SIDEBAR_COLUMN_EJECT, &can_eject,
                         -1);
 
@@ -3702,9 +4722,9 @@ clear_eject_hover (GtkTreeModel *model,
         size = EJECT_ICON_SIZE_NOT_HOVERED;
     }
 
-    gtk_tree_store_set (hdata->sidebar->store, iter,
-                        PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE, size,
-                        -1);
+	fm_tree_model_set (hdata->sidebar->store, &fm_iter,
+	                    PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE, size,
+	                    -1);
 
     return FALSE;
 }
@@ -3714,7 +4734,6 @@ motion_notify_cb (GtkWidget         *widget,
                   GdkEventMotion    *event,
                   NemoPlacesSidebar *sidebar)
 {
-    GtkTreeModel *model;
     GtkTreePath *path = NULL;
     GtkTreePath *store_path = NULL;
     gboolean editing;
@@ -3728,10 +4747,8 @@ motion_notify_cb (GtkWidget         *widget,
         return GDK_EVENT_PROPAGATE;
     }
 
-    model = gtk_tree_view_get_model (GTK_TREE_VIEW (sidebar->tree_view));
-
     if (over_eject_button (sidebar, event->x, event->y, &path)) {
-        store_path = gtk_tree_model_filter_convert_path_to_child_path (GTK_TREE_MODEL_FILTER (model), path);
+		store_path = path;
     }
 
     ClearHoverData data = { sidebar, store_path };
@@ -3741,7 +4758,7 @@ motion_notify_cb (GtkWidget         *widget,
         gtk_tree_path_free (store_path);
     }
 
-    gtk_tree_path_free (path);
+
 
     return FALSE;
 }
@@ -3827,12 +4844,15 @@ query_tooltip_callback (GtkWidget *widget,
                 tooltip_markup = g_strdup (_("Stop"));
             }
         } else {
+            if (type == PLACES_BUILT_IN) {
+                return FALSE;
+            }
             gtk_tree_model_get (model,
                                 &iter,
                                 PLACES_SIDEBAR_COLUMN_TOOLTIP, &tooltip_markup,
                                 -1);
         }
-
+	if(tooltip_markup == NULL) return FALSE;
         gtk_tooltip_set_markup (tooltip, tooltip_markup);
         gtk_tree_view_set_tooltip_cell (GTK_TREE_VIEW (widget), tooltip, path, NULL, NULL);
 
@@ -3857,24 +4877,35 @@ update_expanded_state (GtkTreeView *tree_view,
         return;
 
     SectionType type;
+    PlaceType   placetype;
     GtkTreeIter heading_iter;
     GtkTreeModel *model = gtk_tree_view_get_model (tree_view);
     gtk_tree_model_get_iter (GTK_TREE_MODEL (model), &heading_iter, path);
-    gtk_tree_model_get (model, iter,
+    gtk_tree_model_get (model, &heading_iter,
                     PLACES_SIDEBAR_COLUMN_SECTION_TYPE, &type,
+                    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &placetype,
                     -1);
-    if (type == SECTION_COMPUTER) {
-        sidebar->my_computer_expanded = expanded;
-        g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_MY_COMPUTER_EXPANDED, expanded);
-    } else if (type == SECTION_BOOKMARKS) {
-        sidebar->bookmarks_expanded = expanded;
-        g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_BOOKMARKS_EXPANDED, expanded);
-    } else if (type == SECTION_DEVICES) {
-        sidebar->devices_expanded = expanded;
-        g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_DEVICES_EXPANDED, expanded);
-    } else if (type == SECTION_NETWORK) {
-        sidebar->network_expanded = expanded;
-        g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_NETWORK_EXPANDED, expanded);
+    if(placetype == PLACES_HEADING) {
+        switch (type) {
+            case SECTION_COMPUTER:
+                sidebar->my_computer_expanded = expanded;
+                g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_MY_COMPUTER_EXPANDED, expanded);
+                break;
+            case SECTION_BOOKMARKS:
+                sidebar->bookmarks_expanded = expanded;
+                g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_BOOKMARKS_EXPANDED, expanded);
+                break;
+            case SECTION_DEVICES:
+                sidebar->devices_expanded = expanded;
+                g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_DEVICES_EXPANDED, expanded);
+                break;
+            case SECTION_NETWORK:
+                sidebar->network_expanded = expanded;
+                g_settings_set_boolean (nemo_window_state, NEMO_WINDOW_STATE_NETWORK_EXPANDED, expanded);
+                break;
+            default:
+                return;
+        }
     }
 }
 
@@ -3903,6 +4934,9 @@ row_expanded_cb (GtkTreeView *tree_view,
                            path,
                            user_data,
                            TRUE);
+    GtkTreeSelection *sel = gtk_tree_view_get_selection(tree_view);
+    gtk_tree_selection_unselect_all(sel);
+    gtk_tree_selection_select_path(sel, path);
 }
 
 static void
@@ -3916,8 +4950,11 @@ row_activated_cb (GtkTreeView       *tree_view,
     PlaceType place_type;
 
     NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (user_data);
-    GtkTreeModel *model = gtk_tree_view_get_model (tree_view);
+    GtkTreeModel *model = (GtkTreeModel *) (sidebar->store);
     gtk_tree_model_get_iter (GTK_TREE_MODEL (model), &iter, path);
+
+	if(!iter_is_valid(FM_TREE_MODEL(model), &iter))return;
+
     gtk_tree_model_get (model, &iter,
                     PLACES_SIDEBAR_COLUMN_SECTION_TYPE, &section_type,
                     PLACES_SIDEBAR_COLUMN_ROW_TYPE, &place_type,
@@ -3950,8 +4987,8 @@ bookmarks_edited (GtkCellRenderer       *cell,
 	g_object_set (cell, "editable", FALSE, NULL);
 
 	path = gtk_tree_path_new_from_string (path_string);
-	gtk_tree_model_get_iter (GTK_TREE_MODEL (sidebar->store_filter), &iter, path);
-	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store_filter), &iter,
+	gtk_tree_model_get_iter (GTK_TREE_MODEL (sidebar->store), &iter, path);
+	gtk_tree_model_get (GTK_TREE_MODEL (sidebar->store), &iter,
 		            PLACES_SIDEBAR_COLUMN_INDEX, &index,
 		            -1);
 	gtk_tree_path_free (path);
@@ -4021,24 +5058,67 @@ icon_cell_renderer_func (GtkTreeViewColumn *column,
 			 GtkTreeIter *iter,
 			 gpointer user_data)
 {
-	PlaceType type;
+	gboolean expanded;
+	GIcon *gicon = NULL;
+    g_object_get (cell,
+              "is-expanded", &expanded,
+              NULL);
 
 	gtk_tree_model_get (model, iter,
-			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
-			    -1);
+                        expanded ? PLACES_SIDEBAR_OPEN_ICON_COLUMN : PLACES_SIDEBAR_COLUMN_GICON,
+                        &gicon,
+                        -1);
 
-	if (type == PLACES_HEADING) {
-		g_object_set (cell,
-			      "visible", FALSE,
-			      NULL);
+	if (gicon) {
+		g_object_set(cell, "visible", TRUE, "gicon", gicon, NULL);
+		g_object_unref(gicon);
 	} else {
-		g_object_set (cell,
-			      "visible", TRUE,
-                  "xpad", 3,
-                  "ypad", 2,
-			      NULL);
+		g_object_set(cell, "visible", FALSE, NULL);
 	}
 }
+
+
+
+static void
+set_treeview_style(GtkTreeView *treeview, gboolean focused)
+{
+    GtkCssProvider *provider = gtk_css_provider_new();
+
+    if (focused) {
+        gtk_css_provider_load_from_data(provider,
+            "treeview.view:selected { "
+            "   background-color: @theme_selected_bg_color; "
+            "   color: @theme_selected_fg_color; "
+            "}", -1, NULL);
+    } else {
+        gtk_css_provider_load_from_data(provider,
+            "treeview.view:selected { "
+            "   background-color: #d0d0d0; "
+            "   color: @theme_fg_color; "
+            "}", -1, NULL);
+    }
+
+    GtkStyleContext *context = gtk_widget_get_style_context(GTK_WIDGET(treeview));
+    gtk_style_context_add_provider(context,
+        GTK_STYLE_PROVIDER(provider),
+        GTK_STYLE_PROVIDER_PRIORITY_USER);
+    g_object_unref(provider);
+}
+
+static gboolean
+on_tree_focus_in(GtkWidget *widget, GdkEventFocus *event, gpointer user_data)
+{
+    set_treeview_style(GTK_TREE_VIEW(widget), TRUE);
+    return FALSE; // Keep default behavior
+}
+
+static gboolean
+on_tree_focus_out(GtkWidget *widget, GdkEventFocus *event, gpointer user_data)
+{
+    set_treeview_style(GTK_TREE_VIEW(widget), FALSE);
+    return FALSE; // Keep default behavior
+}
+
 
 static void
 padding_cell_renderer_func (GtkTreeViewColumn *column,
@@ -4047,83 +5127,275 @@ padding_cell_renderer_func (GtkTreeViewColumn *column,
 			    GtkTreeIter *iter,
 			    gpointer user_data)
 {
-	PlaceType type;
+    GtkTreePath *path = gtk_tree_model_get_path(model, iter);
+    int depth = gtk_tree_path_get_depth(path); /* Root = 1 */
+    gtk_tree_path_free(path);
 
-	gtk_tree_model_get (model, iter,
-			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
-			    -1);
+    g_object_set(cell,
+                 "width", 3 + (depth - 1) * 0,  /* optional: leicht anpassen */
+                 "visible", TRUE,
+                 NULL);
+}
 
-	if (type == PLACES_HEADING) {
-		g_object_set (cell,
-			      "visible", FALSE,
-			      "xpad", 0,
-			      "ypad", 0,
-			      NULL);
+
+static void
+text_cell_renderer_func(GtkTreeViewColumn *column,
+                        GtkCellRenderer   *renderer,
+                        GtkTreeModel      *model,
+                        GtkTreeIter       *iter,
+                        gpointer           user_data)
+{
+    gchar *name_text = NULL;
+    gchar *heading_text = NULL;
+    gint row_type = 0;
+
+    gtk_tree_model_get(model, iter,
+                       PLACES_SIDEBAR_COLUMN_ROW_TYPE, &row_type,
+                       PLACES_SIDEBAR_COLUMN_NAME, &name_text,
+                       -1);
+
+    if (row_type == PLACES_HEADING) {
+        /* For Headings use HEADING_TEXT (bold) */
+        g_free(name_text);
+
+        gtk_tree_model_get(model, iter,
+                           PLACES_SIDEBAR_COLUMN_HEADING_TEXT, &heading_text,
+                           -1);
+
+        g_object_set(renderer,
+                     "weight", PANGO_WEIGHT_BOLD,
+                     "weight-set", TRUE,
+                     NULL);
+
+        g_object_set(renderer, "text", heading_text ? heading_text : "", NULL);
+        g_free(heading_text);
+    } else {
+        const gchar *display = "";
+        if (name_text != NULL && *name_text != '\0')
+            display = name_text;
+
+        g_object_set(renderer,
+                     "weight-set", FALSE,
+                     NULL);
+
+        g_object_set(renderer, "text", display, NULL);
+
+        g_free(name_text);
+    }
+}
+
+enum
+{
+  PROP_DISK_FULL_PERCENTAGE = 1,
+  PROP_SHOW_DISK_FULL_PERCENTAGE = 2,
+};
+
+static void
+nemo_places_tree_sidebar_renderer_init(NemoPlacesSidebar *sidebar, GtkTreeView *tree_view)
+{
+    GtkCellRenderer *cell;
+    GtkTreeViewColumn *primary_column;
+
+    /* === primary row === */
+    primary_column = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_expand(primary_column, TRUE);
+
+    /* --- padding Cell renderer --- */
+    cell = gtk_cell_renderer_text_new();
+    gtk_tree_view_column_pack_start(primary_column, cell, FALSE);
+    gtk_tree_view_column_set_cell_data_func(primary_column, cell, padding_cell_renderer_func, sidebar, NULL);
+    sidebar->padding_cell_renderer = cell;
+
+    /* --- icon cell renderer --- */
+    cell = gtk_cell_renderer_pixbuf_new();
+    g_object_set(cell,
+                 "xalign", 0.0,
+                 "follow-state", TRUE,
+                 NULL);
+    gtk_tree_view_column_pack_start(primary_column, cell, FALSE);
+    gtk_tree_view_column_set_cell_data_func(primary_column, cell, icon_cell_renderer_func, sidebar, NULL);
+    sidebar->icon_cell_renderer = cell;
+
+    /* --- text renderer --- */
+	cell = sidebar->editable_renderer = nemo_cell_renderer_disk_new();
+	NEMO_CELL_RENDERER_DISK(cell)->direction = gtk_widget_get_direction(GTK_WIDGET(tree_view));
+	gtk_tree_view_column_pack_start(primary_column, cell, TRUE);
+	g_object_set(cell, "editable", FALSE, NULL);
+
+	/* remove 'text' here — we set text exclusively in text_cell_renderer_func */
+	gtk_tree_view_column_set_attributes(primary_column, cell,
+		                                "editable-set", PLACES_SIDEBAR_COLUMN_BOOKMARK,
+		                                "disk-full-percent", PLACES_SIDEBAR_COLUMN_DF_PERCENT,
+		                                "show-disk-full-percent", PLACES_SIDEBAR_COLUMN_SHOW_DF,
+		                                NULL);
+
+	/* set cell data func, which considers TREE_NAME and NAME  */
+	gtk_tree_view_column_set_cell_data_func(primary_column, cell, text_cell_renderer_func, sidebar, NULL);
+
+	g_signal_connect(cell, "edited", G_CALLBACK(bookmarks_edited), sidebar);
+	g_signal_connect(cell, "editing-canceled", G_CALLBACK(bookmarks_editing_canceled), sidebar);
+
+	gtk_tree_view_append_column(tree_view, primary_column);
+    /* === Eject Column === */
+    sidebar->eject_column = gtk_tree_view_column_new();
+    gtk_tree_view_column_set_sizing(sidebar->eject_column, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
+    gtk_tree_view_column_set_min_width(sidebar->eject_column, EJECT_COLUMN_MIN_WIDTH);
+    gtk_tree_view_column_set_max_width(sidebar->eject_column, EJECT_COLUMN_MAX_WIDTH);
+
+    /* Eject Icon Renderer */
+    cell = gtk_cell_renderer_pixbuf_new();
+    sidebar->eject_icon_cell_renderer = cell;
+    g_object_set(cell,
+                 "mode", GTK_CELL_RENDERER_MODE_ACTIVATABLE,
+                 "yalign", 0.8,
+                 "width", menu_icon_pixels,
+                 NULL);
+    gtk_tree_view_column_pack_start(sidebar->eject_column, cell, FALSE);
+    gtk_tree_view_column_set_attributes(sidebar->eject_column, cell,
+                                        "visible", PLACES_SIDEBAR_COLUMN_EJECT,
+                                        "icon-name", PLACES_SIDEBAR_COLUMN_EJECT_ICON,
+                                        "stock-size", PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE,
+                                        NULL);
+
+    gtk_tree_view_append_column(tree_view, sidebar->eject_column);
+
+}
+
+static void
+hidden_files_mode_changed_callback (NemoWindow *window,
+                    NemoPlacesSidebar *sidebar)
+{
+   update_filtering_from_preferences (sidebar);
+}
+
+static void
+notify_clipboard_info (NemoClipboardMonitor *monitor,
+                       NemoClipboardInfo *info,
+                       NemoPlacesSidebar *sidebar)
+{
+	if (info != NULL && info->cut) {
+		fm_tree_model_set_highlight_for_files ( FM_TREE_MODEL (sidebar->store), info->files);
 	} else {
-		g_object_set (cell,
-			      "visible", TRUE,
-			      "ypad", 3,
-			      NULL);
+		fm_tree_model_set_highlight_for_files ( FM_TREE_MODEL (sidebar->store), NULL);
 	}
 }
 
 static void
-heading_cell_renderer_func (GtkTreeViewColumn *column,
-			    GtkCellRenderer *cell,
-			    GtkTreeModel *model,
-			    GtkTreeIter *iter,
-			    gpointer user_data)
+refresh_highlight (NemoPlacesSidebar *sidebar)
 {
-	PlaceType type;
+	NemoClipboardMonitor *monitor;
+	NemoClipboardInfo *info;
 
-	gtk_tree_model_get (model, iter,
-			    PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
-			    -1);
+	monitor = nemo_clipboard_monitor_get ();
+	info = nemo_clipboard_monitor_get_clipboard_info (monitor);
 
-	if (type == PLACES_HEADING) {
-		g_object_set (cell,
-			      "visible", TRUE,
-			      NULL);
-	} else {
-		g_object_set (cell,
-			      "visible", FALSE,
-			      NULL);
+	notify_clipboard_info (monitor, info, sidebar);
+}
+
+
+
+
+
+
+static int
+compare_rows (GtkTreeModel *model, GtkTreeIter *a, GtkTreeIter *b, gpointer callback_data)
+{
+	NemoFile *file_a, *file_b;
+	int result;
+
+	/* Dummy rows are always first */
+	if (a->user_data == NULL) {
+		return -1;
 	}
+	else if (b->user_data == NULL) {
+		return 1;
+	}
+
+	/* don't sort root nodes */
+	if (fm_tree_model_iter_is_root (FM_TREE_MODEL (model), a) &&
+	    fm_tree_model_iter_is_root (FM_TREE_MODEL (model), b)) {
+		return fm_tree_model_iter_compare_roots (FM_TREE_MODEL (model), a, b);
+	}
+
+	file_a = fm_tree_model_iter_get_file (FM_TREE_MODEL (model), a);
+	file_b = fm_tree_model_iter_get_file (FM_TREE_MODEL (model), b);
+
+	if (file_a == file_b) {
+		result = 0;
+	} else if (file_a == NULL) {
+		result = -1;
+	} else if (file_b == NULL) {
+		result = +1;
+	} else {
+        result = nemo_file_compare_for_sort (file_a, file_b,
+                                             NEMO_FILE_SORT_BY_DISPLAY_NAME,
+                                             FALSE, //sidebar->sort_directories_first,
+                                             FALSE, //sidebar->sort_favorites_first,
+                                             FALSE,
+                                             NULL);
+	}
+
+	nemo_file_unref (file_a);
+	nemo_file_unref (file_b);
+
+	return result;
 }
 
-static gboolean
-row_visibility_function (GtkTreeModel *model,
-                         GtkTreeIter  *iter,
-                         gpointer      data)
+
+
+static void
+row_loaded_callback (GtkTreeModel     *tree_model,
+		     GtkTreeIter      *iter,
+		     NemoPlacesSidebar *sidebar)
 {
-    NemoPlacesSidebar *sidebar = NEMO_PLACES_SIDEBAR (data);
+	NemoFile *file, *tmp_file, *selection_file;
 
-    SectionType section_type;
-    PlaceType type;
+	if (sidebar->selection_location == NULL
+	    || !sidebar->selecting
+	    || iter->user_data == NULL || iter->stamp == 0) {
+		return;
+	}
 
-    gtk_tree_model_get (model, iter,
-                        PLACES_SIDEBAR_COLUMN_SECTION_TYPE, &section_type,
-                        PLACES_SIDEBAR_COLUMN_ROW_TYPE, &type,
-                        -1);
+	file = fm_tree_model_iter_get_file ( FM_TREE_MODEL (sidebar->store), iter);
+	if (file == NULL) {
+		return;
+	}
+	if (!nemo_file_is_directory (file)) {
+		nemo_file_unref(file);
+		return;
+	}
 
-    if (type != PLACES_HEADING || section_type != SECTION_BOOKMARKS)
-        return TRUE;
+	/* if iter is ancestor of wanted selection_location then update selection */
+	selection_file = nemo_file_get_by_uri (sidebar->selection_location);
+	while (selection_file != NULL) {
+		if (file == selection_file) {
+			nemo_file_unref (file);
+			nemo_file_unref (selection_file);
 
-    if (sidebar->in_drag)
-        return TRUE;
-
-    if ((int)nemo_bookmark_list_length (sidebar->bookmarks) > sidebar->bookmark_breakpoint)
-        return TRUE;
-
-    return FALSE;
+			schedule_show_selection (sidebar);
+			return;
+		}
+		tmp_file = nemo_file_get_parent (selection_file);
+		nemo_file_unref (selection_file);
+		selection_file = tmp_file;
+	}
+	nemo_file_unref (file);
 }
+
+
+static gint
+get_icon_scale_callback (FMTreeModel *model,
+                         NemoPlacesSidebar  *sidebar)
+{
+   return gtk_widget_get_scale_factor (GTK_WIDGET (sidebar->tree_view));
+}
+
+//static GdkAtom copied_files_atom;
 
 static void
 nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
 {
 	GtkTreeView       *tree_view;
-	GtkTreeViewColumn *primary_column, *expander_column, *expander_pad_column;
-	GtkCellRenderer   *cell;
 	GtkTreeSelection  *selection;
 	GtkStyleContext   *style_context;
 
@@ -4132,16 +5404,23 @@ nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
                                                             "changed",
                                                             G_CALLBACK (actions_changed),
                                                             sidebar);
+
+
     sidebar->ui_manager = gtk_ui_manager_new ();
 
     sidebar->in_drag = FALSE;
 
     sidebar->desktop_dnd_source_fs = NULL;
-    sidebar->desktop_dnd_can_delete_source = FALSE;
-
-	sidebar->volume_monitor = g_volume_monitor_get ();
+    sidebar->desktop_dnd_can_delete_source = TRUE;
 
     sidebar->update_places_on_idle_id = 0;
+
+    sidebar->bookmarks_changed_id = 0;
+
+    sidebar-> hidden_files_changed_id = 0;
+
+	sidebar->volume_monitor = NULL;
+
 
     sidebar->my_computer_expanded = g_settings_get_boolean (nemo_window_state,
                                                             NEMO_WINDOW_STATE_MY_COMPUTER_EXPANDED);
@@ -4167,164 +5446,59 @@ nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
 	/* Make it easier for theme authors to style the sidebar */
 	gtk_style_context_add_class (style_context, "nemo-places-sidebar");
 
-  	/* tree view */
+
+	sidebar->store = fm_tree_model_new();
+	GType model_types[PLACES_SIDEBAR_COLUMN_COUNT] = {
+		G_TYPE_STRING,      		// FM_TREE_MODEL_DISPLAY_NAME_COLUMN
+		g_icon_get_type(),		// FM_TREE_MODEL_CLOSED_ICON_COLUMN
+		g_icon_get_type(),		// FM_TREE_MODEL_OPEN_ICON_COLUMN
+		PANGO_TYPE_STYLE,		// FM_TREE_MODEL_FONT_STYLE_COLUMN
+		G_TYPE_INT,				// FM_TREE_MODEL_TEXT_WEIGHT_COLUMN
+	    G_TYPE_INT,				// PLACES_SIDEBAR_COLUMN_ROW_TYPE
+		G_TYPE_STRING,			// PLACES_SIDEBAR_COLUMN_URI
+		G_TYPE_DRIVE,			// PLACES_SIDEBAR_COLUMN_DRIVE
+		G_TYPE_VOLUME,			// PLACES_SIDEBAR_COLUMN_VOLUME
+		G_TYPE_MOUNT,			// PLACES_SIDEBAR_COLUMN_MOUNT
+		G_TYPE_INT,				// PLACES_SIDEBAR_COLUMN_INDEX
+		G_TYPE_BOOLEAN,			// PLACES_SIDEBAR_COLUMN_EJECT
+		G_TYPE_BOOLEAN,			// PLACES_SIDEBAR_COLUMN_NO_EJECT
+		G_TYPE_BOOLEAN,			// PLACES_SIDEBAR_COLUMN_BOOKMARK
+		G_TYPE_STRING,			// PLACES_SIDEBAR_COLUMN_TOOLTIP
+		G_TYPE_STRING,			// PLACES_SIDEBAR_COLUMN_EJECT_ICON
+	    G_TYPE_INT,				// PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE
+		G_TYPE_INT,				// PLACES_SIDEBAR_COLUMN_SECTION_TYPE
+		G_TYPE_STRING,			// PLACES_SIDEBAR_COLUMN_HEADING_TEXT
+	    G_TYPE_INT,				// PLACES_SIDEBAR_COLUMN_DF_PERCENT
+		G_TYPE_BOOLEAN,			// PLACES_SIDEBAR_COLUMN_SHOW_DF
+		G_TYPE_STRING			// PLACES_SIDEBAR_COLUMN_TREE_NAME
+	};
+	fm_tree_model_set_column_types((FMTreeModel*)(sidebar->store), PLACES_SIDEBAR_COLUMN_COUNT, model_types);
+
 	tree_view = GTK_TREE_VIEW (nemo_places_tree_view_new ());
 
 	gtk_tree_view_set_headers_visible (tree_view, FALSE);
 
-    primary_column = GTK_TREE_VIEW_COLUMN (gtk_tree_view_column_new ());
-    gtk_tree_view_column_set_max_width (GTK_TREE_VIEW_COLUMN (primary_column), NEMO_ICON_SIZE_SMALLER);
-    gtk_tree_view_column_set_expand (primary_column, TRUE);
+	sidebar->sort_model = (GtkTreeModel*)GTK_TREE_MODEL_SORT (gtk_tree_model_sort_new_with_model (GTK_TREE_MODEL (sidebar->store)));
 
-	/* initial padding */
-	cell = gtk_cell_renderer_text_new ();
-	gtk_tree_view_column_pack_start (primary_column, cell, FALSE);
+	gtk_tree_view_set_search_column (GTK_TREE_VIEW (tree_view), PLACES_SIDEBAR_COLUMN_NAME);
 
-	/* headings */
-	cell = gtk_cell_renderer_text_new ();
-	gtk_tree_view_column_pack_start (primary_column, cell, FALSE);
-	gtk_tree_view_column_set_attributes (primary_column, cell,
-					     "text", PLACES_SIDEBAR_COLUMN_HEADING_TEXT,
-					     NULL);
-	g_object_set (cell,
-		      "weight", PANGO_WEIGHT_BOLD,
-		      "weight-set", TRUE,
-		      "ypad", 0,
-		      "xpad", 0,
-		      NULL);
-	gtk_tree_view_column_set_cell_data_func (primary_column, cell,
-						 heading_cell_renderer_func,
-						 sidebar, NULL);
+	gtk_tree_sortable_set_default_sort_func (GTK_TREE_SORTABLE (sidebar->sort_model),
+					 compare_rows, sidebar, NULL);
 
-	/* icon padding */
-	cell = gtk_cell_renderer_text_new ();
-	gtk_tree_view_column_pack_start (primary_column, cell, FALSE);
-	gtk_tree_view_column_set_cell_data_func (primary_column, cell,
-						 padding_cell_renderer_func,
-						 sidebar, NULL);
+	gtk_tree_view_set_model (tree_view, GTK_TREE_MODEL (sidebar->sort_model));
 
-	/* icon renderer */
-	cell = gtk_cell_renderer_pixbuf_new ();
-    g_object_set (cell,
-                  "follow-state", TRUE,
-                  NULL);
-	gtk_tree_view_column_pack_start (primary_column, cell, FALSE);
-	gtk_tree_view_column_set_attributes (primary_column, cell,
-					     "gicon", PLACES_SIDEBAR_COLUMN_GICON,
-					     NULL);
-	gtk_tree_view_column_set_cell_data_func (primary_column, cell,
-						 icon_cell_renderer_func,
-						 sidebar, NULL);
-
-    /* normal text renderer */
-    cell = sidebar->editable_renderer = nemo_cell_renderer_disk_new ();
-    NEMO_CELL_RENDERER_DISK (cell)->direction = gtk_widget_get_direction (GTK_WIDGET (tree_view));
-    gtk_tree_view_column_pack_start (primary_column, cell, TRUE);
-    g_object_set (G_OBJECT (cell), "editable", FALSE, NULL);
-    gtk_tree_view_column_set_attributes (primary_column, cell,
-                         "text", PLACES_SIDEBAR_COLUMN_NAME,
-                         "editable-set", PLACES_SIDEBAR_COLUMN_BOOKMARK,
-                         "disk-full-percent", PLACES_SIDEBAR_COLUMN_DF_PERCENT,
-                         "show-disk-full-percent", PLACES_SIDEBAR_COLUMN_SHOW_DF,
-                         NULL);
-    g_object_set (cell,
-              "ellipsize", PANGO_ELLIPSIZE_END,
-              "ellipsize-set", TRUE,
-              NULL);
-
-    g_signal_connect (cell, "edited",
-              G_CALLBACK (bookmarks_edited), sidebar);
-    g_signal_connect (cell, "editing-canceled",
-              G_CALLBACK (bookmarks_editing_canceled), sidebar);
-
-    /* eject column */
-    sidebar->eject_column = GTK_TREE_VIEW_COLUMN (gtk_tree_view_column_new ());
-    gtk_tree_view_column_set_sizing (sidebar->eject_column, GTK_TREE_VIEW_COLUMN_GROW_ONLY);
-    gtk_tree_view_column_set_min_width (sidebar->eject_column, EJECT_COLUMN_MIN_WIDTH);
-    gtk_tree_view_column_set_max_width (sidebar->eject_column, EJECT_COLUMN_MAX_WIDTH);
-
-    cell = gtk_cell_renderer_text_new ();
-    gtk_tree_view_column_pack_start (sidebar->eject_column, cell, FALSE);
-    g_object_set (cell, "width", 5, NULL);
-
-	/* eject icon renderer */
-	cell = gtk_cell_renderer_pixbuf_new ();
-	sidebar->eject_icon_cell_renderer = cell;
-	g_object_set (cell,
-		      "mode", GTK_CELL_RENDERER_MODE_ACTIVATABLE,
-		      "yalign", 0.8,
-              "width", menu_icon_pixels,
-		      NULL);
-	gtk_tree_view_column_pack_start (sidebar->eject_column, cell, FALSE);
-	gtk_tree_view_column_set_attributes (sidebar->eject_column, cell,
-					     "visible", PLACES_SIDEBAR_COLUMN_EJECT,
-					     "icon-name", PLACES_SIDEBAR_COLUMN_EJECT_ICON,
-                         "stock-size", PLACES_SIDEBAR_COLUMN_EJECT_ICON_SIZE,
-                         NULL);
-
-    /* eject icon trailing padding (adjusts to always avoid overlay-scrollbars) */
-    gboolean overlay_scrolling;
-    GtkSettings *gtksettings = gtk_settings_get_default ();
-    g_object_get (gtksettings,
-                  "gtk-overlay-scrolling", &overlay_scrolling,
-                  NULL);
-
-    cell = gtk_cell_renderer_text_new ();
-    gtk_tree_view_column_pack_start (sidebar->eject_column, cell, FALSE);
-    gtk_tree_view_column_set_attributes (sidebar->eject_column, cell,
-                                         "visible", PLACES_SIDEBAR_COLUMN_EJECT,
-                                         NULL);
-
-    if (overlay_scrolling) {
-        GtkWidget *vscrollbar = gtk_scrolled_window_get_vscrollbar (GTK_SCROLLED_WINDOW (sidebar));
-        gint nat_width;
-
-        gtk_widget_get_preferred_width (vscrollbar, NULL, &nat_width);
-        g_object_set (cell, "width", nat_width, NULL);
-    } else {
-        g_object_set (cell, "width", 2, NULL);
-    }
-
-    expander_pad_column = GTK_TREE_VIEW_COLUMN (gtk_tree_view_column_new());
-    gtk_tree_view_column_set_sizing (expander_pad_column, GTK_TREE_VIEW_COLUMN_FIXED);
-    gtk_tree_view_column_set_fixed_width (expander_pad_column, EXPANDER_PAD_COLUMN_WIDTH);
-
-    expander_column = GTK_TREE_VIEW_COLUMN (gtk_tree_view_column_new ());
-    gtk_tree_view_column_set_sizing (expander_column, GTK_TREE_VIEW_COLUMN_FIXED);
-
-    gint expander_size;
-    gtk_widget_style_get (GTK_WIDGET (tree_view), "expander-size", &expander_size, NULL);
-    gtk_tree_view_column_set_fixed_width (expander_column, expander_size);
-
-    gtk_tree_view_append_column (tree_view, expander_pad_column);
-    gtk_tree_view_append_column (tree_view, expander_column);
-	gtk_tree_view_append_column (tree_view, primary_column);
-    gtk_tree_view_append_column (tree_view, sidebar->eject_column);
-
-    gtk_tree_view_set_expander_column (tree_view, expander_column);
-
-	sidebar->store = nemo_shortcuts_model_new (sidebar);
-	gtk_tree_sortable_set_sort_column_id (GTK_TREE_SORTABLE (sidebar->store),
-                                          GTK_TREE_SORTABLE_UNSORTED_SORT_COLUMN_ID,
-                                          GTK_SORT_ASCENDING);
-
-    sidebar->store_filter = gtk_tree_model_filter_new (GTK_TREE_MODEL (sidebar->store), NULL);
-
-    gtk_tree_model_filter_set_visible_func (GTK_TREE_MODEL_FILTER (sidebar->store_filter),
-                                            (GtkTreeModelFilterVisibleFunc) row_visibility_function,
-                                            sidebar, NULL);
-
-    gtk_tree_view_set_model (tree_view, GTK_TREE_MODEL (sidebar->store_filter));
-
-    gtk_container_add (GTK_CONTAINER (sidebar), GTK_WIDGET (tree_view));
-    gtk_widget_show (GTK_WIDGET (tree_view));
+	sidebar->tree_view = tree_view;
+	gtk_container_add (GTK_CONTAINER (sidebar), GTK_WIDGET (tree_view));
+	gtk_widget_show (GTK_WIDGET (tree_view));
 
 	gtk_widget_show (GTK_WIDGET (sidebar));
-	sidebar->tree_view = tree_view;
+
+	nemo_places_tree_sidebar_renderer_init (sidebar, tree_view);
 
 	gtk_tree_view_set_search_column (tree_view, PLACES_SIDEBAR_COLUMN_NAME);
 	selection = gtk_tree_view_get_selection (tree_view);
 	gtk_tree_selection_set_mode (selection, GTK_SELECTION_BROWSE);
+
 
 	gtk_tree_selection_set_select_function (selection,
 						tree_selection_func,
@@ -4336,10 +5510,13 @@ nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
 						nemo_shortcuts_source_targets,
 						G_N_ELEMENTS (nemo_shortcuts_source_targets),
 						GDK_ACTION_MOVE);
-	gtk_drag_dest_set (GTK_WIDGET (tree_view),
-			   0,
-			   nemo_shortcuts_drop_targets, G_N_ELEMENTS (nemo_shortcuts_drop_targets),
-			   GDK_ACTION_MOVE | GDK_ACTION_COPY | GDK_ACTION_LINK);
+
+	gtk_tree_view_enable_model_drag_dest(
+		GTK_TREE_VIEW(tree_view),
+		nemo_shortcuts_drop_targets,
+		G_N_ELEMENTS(nemo_shortcuts_drop_targets),
+		GDK_ACTION_MOVE | GDK_ACTION_COPY | GDK_ACTION_LINK
+	);
 
 	g_signal_connect (tree_view, "key-press-event",
 			  G_CALLBACK (bookmarks_key_press_event_cb), sidebar);
@@ -4376,6 +5553,12 @@ nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
                              G_CALLBACK (query_tooltip_callback), sidebar, 0);
     gtk_widget_set_has_tooltip (GTK_WIDGET (tree_view), TRUE);
 
+	g_signal_connect(sidebar->tree_view, "focus-in-event",
+		             G_CALLBACK(on_tree_focus_in), NULL);
+
+	g_signal_connect(sidebar->tree_view, "focus-out-event",
+		             G_CALLBACK(on_tree_focus_out), NULL);
+
 	g_signal_connect_swapped (nemo_preferences, "changed::" NEMO_PREFERENCES_DESKTOP_IS_HOME_DIR,
 				  G_CALLBACK(desktop_setting_changed_callback),
 				  sidebar);
@@ -4397,6 +5580,16 @@ nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
                               "changed",
                               G_CALLBACK (favorites_changed_cb),
                               sidebar);
+
+	fm_tree_model_set_custom_row_draggable_func (sidebar->store, nemo_places_sidebar_row_draggable, sidebar);
+
+	g_signal_connect_object (sidebar->store, "row_loaded",
+	                     G_CALLBACK (row_loaded_callback),
+                         sidebar, G_CONNECT_AFTER);
+
+		g_signal_connect_object (sidebar->store, "get-icon-scale",
+                         G_CALLBACK (get_icon_scale_callback), sidebar, 0);
+
 }
 
 static void
@@ -4405,12 +5598,25 @@ nemo_places_sidebar_dispose (GObject *object)
 	NemoPlacesSidebar *sidebar;
 
 	sidebar = NEMO_PLACES_SIDEBAR (object);
+	tree_model_remove_all_nodes(sidebar);
 
-	sidebar->window = NULL;
-	sidebar->tree_view = NULL;
+	g_clear_object (&sidebar->desktop_dnd_source_fs);
 
-	g_free (sidebar->uri);
-	sidebar->uri = NULL;
+	if (sidebar->expand_timeout_source > 0) {
+          g_source_remove(sidebar->expand_timeout_source);
+          sidebar->expand_timeout_source = 0;
+        }
+
+	if(sidebar->tree_view != NULL)
+	{
+	    g_signal_handlers_disconnect_by_data(sidebar->tree_view, sidebar);
+	    gtk_tree_view_set_model(GTK_TREE_VIEW(sidebar->tree_view), NULL);
+	    gtk_widget_destroy(GTK_WIDGET(sidebar->tree_view));
+	    sidebar->tree_view = NULL;
+	}
+
+	g_clear_object (&sidebar->ui_manager);
+	sidebar->ui_manager = NULL;
 
 	free_drag_data (sidebar);
 
@@ -4427,15 +5633,16 @@ nemo_places_sidebar_dispose (GObject *object)
                                      sidebar->actions_changed_id);
         sidebar->actions_changed_id = 0;
     }
-
     g_clear_object (&sidebar->action_manager);
 
     if (sidebar->update_places_on_idle_id != 0) {
         g_source_remove (sidebar->update_places_on_idle_id);
         sidebar->update_places_on_idle_id = 0;
     }
-
-	g_clear_object (&sidebar->store);
+	if (sidebar->hidden_files_changed_id != 0 && sidebar->window) {
+        g_signal_handler_disconnect(sidebar->window, sidebar->hidden_files_changed_id);
+        sidebar->hidden_files_changed_id = 0;
+    }
 
     g_clear_pointer (&sidebar->top_bookend_uri, g_free);
     g_clear_pointer (&sidebar->bottom_bookend_uri, g_free);
@@ -4443,7 +5650,7 @@ nemo_places_sidebar_dispose (GObject *object)
 	if (sidebar->go_to_after_mount_slot) {
 		g_object_remove_weak_pointer (G_OBJECT (sidebar->go_to_after_mount_slot),
 					      (gpointer *) &sidebar->go_to_after_mount_slot);
-		sidebar->go_to_after_mount_slot = NULL;
+		 g_clear_object (&sidebar->go_to_after_mount_slot);
 	}
 
     g_signal_handlers_disconnect_by_func (nemo_window_state,
@@ -4451,10 +5658,14 @@ nemo_places_sidebar_dispose (GObject *object)
                                           sidebar);
 
 	g_signal_handlers_disconnect_by_func (nemo_preferences,
+                                          reset_menu,
+                                          sidebar);
+
+	g_signal_handlers_disconnect_by_func (nemo_preferences,
 					      desktop_setting_changed_callback,
 					      sidebar);
 
-	g_signal_handlers_disconnect_by_func (gnome_background_preferences,
+	g_signal_handlers_disconnect_by_func (nemo_desktop_preferences,
 					      desktop_setting_changed_callback,
 					      sidebar);
 
@@ -4488,8 +5699,28 @@ nemo_places_sidebar_dispose (GObject *object)
 
 		g_clear_object (&sidebar->volume_monitor);
 	}
-
+	if(sidebar->selection_location) {
+		g_free (sidebar->selection_location);
+		sidebar->selection_location = NULL;
+	}
+	sidebar->window = NULL;
 	G_OBJECT_CLASS (nemo_places_sidebar_parent_class)->dispose (object);
+}
+
+static void
+nemo_places_tree_sidebar_finalize (GObject *object)
+{
+	NemoPlacesSidebar *sidebar;
+
+	sidebar = NEMO_PLACES_SIDEBAR (object);
+
+	if(sidebar) {
+		if (sidebar->store_filter) g_clear_object(&sidebar->store_filter);
+		if(sidebar->sort_model)	g_object_unref (sidebar->sort_model);
+		if(sidebar->store) g_clear_object(&sidebar->store);
+	}
+
+	G_OBJECT_CLASS (nemo_places_sidebar_parent_class)->finalize (object);
 }
 
 static void
@@ -4499,6 +5730,7 @@ nemo_places_sidebar_class_init (NemoPlacesSidebarClass *class)
     GtkWidgetClass *widget_class = GTK_WIDGET_CLASS (class);
 
     oclass->dispose = nemo_places_sidebar_dispose;
+	oclass->finalize = nemo_places_tree_sidebar_finalize;
 
 	widget_class->style_set = nemo_places_sidebar_style_set;
 	widget_class->focus = nemo_places_sidebar_focus;
@@ -4507,6 +5739,7 @@ nemo_places_sidebar_class_init (NemoPlacesSidebarClass *class)
     EJECT_ICON_SIZE_NOT_HOVERED = gtk_icon_size_register ("menu-icon-size-small",
                                                           menu_icon_pixels - EJECT_ICON_SIZE_REDUCTION,
                                                           menu_icon_pixels - EJECT_ICON_SIZE_REDUCTION);
+	copied_files_atom = gdk_atom_intern ("x-special/gnome-copied-files", FALSE);
 }
 
 static gboolean
@@ -4529,7 +5762,8 @@ update_places_on_idle (NemoPlacesSidebar *sidebar)
 
     sidebar->update_places_on_idle_id = g_idle_add_full (G_PRIORITY_LOW,
                                                          (GSourceFunc) update_places_on_idle_callback,
-                                                         sidebar, NULL);
+                                                         g_object_ref(sidebar),
+														 (GDestroyNotify) g_object_unref);
 }
 
 static void
@@ -4541,10 +5775,18 @@ nemo_places_sidebar_set_parent_window (NemoPlacesSidebar *sidebar,
 
 	sidebar->window = window;
 
+
+	g_signal_connect_object (window, "loading_uri",
+					 G_CALLBACK (loading_uri_callback), sidebar, 0);
+
+	sidebar->hidden_files_changed_id =
+	                g_signal_connect_object (window, "hidden-files-mode-changed",
+	                                         G_CALLBACK (hidden_files_mode_changed_callback), sidebar, 0);
+
 	slot = nemo_window_get_active_slot (window);
 
 	sidebar->bookmarks = nemo_bookmark_list_get_default ();
-	sidebar->uri = nemo_window_slot_get_current_uri (slot);
+	sidebar->selection_location = nemo_window_slot_get_current_uri (slot);
 
     breakpoint = g_settings_get_int (nemo_window_state, NEMO_PREFERENCES_SIDEBAR_BOOKMARK_BREAKPOINT);
 
@@ -4562,9 +5804,7 @@ nemo_places_sidebar_set_parent_window (NemoPlacesSidebar *sidebar,
 					  G_CALLBACK (update_places_on_idle),
 					  sidebar);
 
-	g_signal_connect_object (window, "loading_uri",
-				 G_CALLBACK (loading_uri_callback),
-				 sidebar, 0);
+    if (sidebar->volume_monitor == NULL) sidebar->volume_monitor = g_volume_monitor_get ();
 
 	g_signal_connect_object (sidebar->volume_monitor, "volume_added",
 				 G_CALLBACK (volume_added_callback), sidebar, 0);
@@ -4587,7 +5827,6 @@ nemo_places_sidebar_set_parent_window (NemoPlacesSidebar *sidebar,
 
 	g_signal_connect_swapped (nemo_preferences, "changed::" NEMO_PREFERENCES_ALWAYS_USE_BROWSER,
 				 G_CALLBACK (reset_menu), sidebar);
-	update_places (sidebar);
 }
 
 static void
@@ -4597,7 +5836,7 @@ nemo_places_sidebar_style_set (GtkWidget *widget,
 	NemoPlacesSidebar *sidebar;
 
 	sidebar = NEMO_PLACES_SIDEBAR (widget);
-	update_places (sidebar);
+	if(sidebar->tree_view)   update_places (sidebar);
 }
 
 GtkWidget *
@@ -4612,13 +5851,10 @@ nemo_places_sidebar_new (NemoWindow *window)
 }
 
 
-/* Drag and drop interfaces */
-
-/* GtkTreeDragSource::row_draggable implementation for the shortcuts filter model */
-
 static gboolean
-nemo_shortcuts_model_row_draggable (GtkTreeDragSource *drag_source,
-					GtkTreePath       *path)
+nemo_places_sidebar_row_draggable (GtkTreeDragSource *drag_source,
+								  GtkTreePath       *path,
+								  gpointer user_data)
 {
 	GtkTreeModel *model;
 	GtkTreeIter iter;
@@ -4638,57 +5874,4 @@ nemo_shortcuts_model_row_draggable (GtkTreeDragSource *drag_source,
 		return TRUE;
 
 	return FALSE;
-}
-
-static void
-_nemo_shortcuts_model_class_init (NemoShortcutsModelClass *klass)
-{
-
-}
-
-static void
-_nemo_shortcuts_model_init (NemoShortcutsModel *model)
-{
-	model->sidebar = NULL;
-}
-
-static void
-_nemo_shortcuts_model_drag_source_init (GtkTreeDragSourceIface *iface)
-{
-	iface->row_draggable = nemo_shortcuts_model_row_draggable;
-}
-
-static GtkTreeStore *
-nemo_shortcuts_model_new (NemoPlacesSidebar *sidebar)
-{
-	NemoShortcutsModel *model;
-	GType model_types[PLACES_SIDEBAR_COLUMN_COUNT] = {
-        G_TYPE_INT,
-		G_TYPE_STRING,
-		G_TYPE_DRIVE,
-		G_TYPE_VOLUME,
-		G_TYPE_MOUNT,
-		G_TYPE_STRING,
-		G_TYPE_ICON,
-		G_TYPE_INT,
-		G_TYPE_BOOLEAN,
-		G_TYPE_BOOLEAN,
-		G_TYPE_BOOLEAN,
-		G_TYPE_STRING,
-		G_TYPE_STRING,
-        G_TYPE_INT,
-		G_TYPE_INT,
-		G_TYPE_STRING,
-        G_TYPE_INT,
-        G_TYPE_BOOLEAN
-	};
-
-	model = g_object_new (NEMO_TYPE_SHORTCUTS_MODEL, NULL);
-	model->sidebar = sidebar;
-
-	gtk_tree_store_set_column_types (GTK_TREE_STORE (model),
-					 PLACES_SIDEBAR_COLUMN_COUNT,
-					 model_types);
-
-	return GTK_TREE_STORE (model);
 }
