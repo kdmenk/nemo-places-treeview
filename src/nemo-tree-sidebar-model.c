@@ -1249,7 +1249,8 @@ done_loading_callback (NemoDirectory *directory,
 	}
 	set_done_loading (root->model, node, TRUE);
 
-	// Check if the node has no children
+/*
+	// Check if the node has no children if no children exist the expand is closed
 	if (node->first_child == NULL) {
 		// Inform GTK that the node has no children
 		if (tree_node_has_dummy_child(node)) {
@@ -1264,7 +1265,7 @@ done_loading_callback (NemoDirectory *directory,
 		make_iter_for_node(node, &iter, root->model->details->stamp);
 		report_row_has_child_toggled(root->model, &iter);
 	}
-
+*/
 	nemo_file_unref (file);
 
 	make_iter_for_node (node, &iter, root->model->details->stamp);
