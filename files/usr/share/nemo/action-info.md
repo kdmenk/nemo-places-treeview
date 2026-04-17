@@ -4,7 +4,7 @@ _This documentation is available online at https://github.com/linuxmint/nemo/wik
 ### About
 Nemo actions allow the user to add custom menu actions to apply to selected files. These can be one-shot commands or call their own scripts, and can be restricted to specific files by defining various conditions for the action.
 
-Action files are just text files that end in `.nemo_action` and are stored in system and user data locations - `/usr/share/nemo/actions`, `~/.local/usr/share/nemo/actions` (all of your environment's `XDG_DATA_DIRS` are scanned, though typically only the aforementioned are used).
+Action files are just text files that end in `.nemo_action` and are stored in system and user data locations - `/usr/share/nemo/actions`, `~/.local/share/nemo/actions` (all of your environment's `XDG_DATA_DIRS` are scanned, though typically only the aforementioned are used).
 
 These files are structured as follows (this is a standard keyfile syntax also used in application .desktop and config files):
 
@@ -160,6 +160,8 @@ Can be one or more of:
 - `gsettings <schema> <boolean key>`: The boolean key in the given schema must be true.
 - `gsettings <schema> <key> <key-type> <[eq|ne|gt|lt]> <value>`: The value of `<key>` is [`equal|not equal|greater than|less than`] `<value>`. The `<key-types>` must match, but the comparisons are not clearly defined for non-numerical types.
 - `exec <program>`: Run `<program>` (absolute path or PATH executable) and interpret its exit code as 0 for passing, and non-0 for failure.
+- `sidebar-allow`: Also show this action in the places sidebar's context menu. By default, actions are hidden from the sidebar. Cannot be used with `sidebar-only`. (6.8)
+- `sidebar-only`: Only show this action in the places sidebar's context menu, never in normal file views. Useful with actions that only make sense against sidebar entries (bookmarks, mounts, etc). Cannot be used with `sidebar-allow` (6.8)
 
 **Terminal** (optional): Set to true to execute the Exec line in a spawned terminal window.
   
@@ -239,7 +241,7 @@ Separator=,
 Quote=single|double|backtick
 Dependencies=notify-send;!zenity;
 UriScheme=sftp
-Conditions=desktop;dbus <name>;gsettings foo_schema foo_boolkey;removable;exec <program>;
+Conditions=desktop;dbus <name>;gsettings foo_schema foo_boolkey;removable;exec <program>;sidebar-allow;sidebar-only;
 Terminal=true|false
 Files=.bash*;!.bashrc;
 Locations=.*;!.config;

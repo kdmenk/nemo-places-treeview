@@ -3052,6 +3052,7 @@ create_volume_usage_widget (NemoPropertiesWindow *window)
 	uri = nemo_file_get_activation_uri (file);
 
 	location = g_file_new_for_uri (uri);
+	g_free (uri);
 	info = g_file_query_filesystem_info (location, "filesystem::*", NULL, NULL);
 
 	if (info) {
@@ -4719,7 +4720,6 @@ get_pending_key (GList *file_list)
 	GList *l;
 	GList *uris;
 	GString *key;
-	char *ret;
 
 	uris = NULL;
 	for (l = file_list; l != NULL; l = l->next) {
@@ -4735,10 +4735,7 @@ get_pending_key (GList *file_list)
 
 	g_list_free_full (uris, g_free);
 
-	ret = key->str;
-	g_string_free (key, FALSE);
-
-	return ret;
+	return g_string_free (key, FALSE);
 }
 
 static StartupData *
